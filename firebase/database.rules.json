@@ -1,0 +1,19 @@
+{
+  "rules": {
+    "lobbies": {
+      ".read": "auth != null",
+      "$challengeId": {
+        ".write": "auth != null",
+        ".validate": "newData.hasChildren(['format', 'hostDisplayName', 'hostPlayerId', 'matchType', 'createdAt', 'status']) || data.exists()"
+      }
+    },
+    "formats": {
+      ".read": "auth != null",
+      ".write": false
+    },
+    "formatList": {
+      ".read": "auth != null",
+      ".write": false
+    }
+  }
+}

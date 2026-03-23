@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MTGA Enhancement Suite — Join Lobby</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+        .container {
+            max-width: 480px;
+            width: 90%;
+            text-align: center;
+            padding: 40px 30px;
+            background: #16213e;
+            border-radius: 12px;
+            border: 1px solid #0f3460;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+        }
+        h1 {
+            font-size: 1.6rem;
+            color: #e94560;
+            margin-bottom: 8px;
+        }
+        .subtitle {
+            font-size: 0.9rem;
+            color: #888;
+            margin-bottom: 24px;
+        }
+        .status {
+            font-size: 1.1rem;
+            margin-bottom: 20px;
+            padding: 16px;
+            background: #0f3460;
+            border-radius: 8px;
+        }
+        .spinner {
+            display: inline-block;
+            width: 20px; height: 20px;
+            border: 3px solid #333;
+            border-top-color: #e94560;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            vertical-align: middle;
+            margin-right: 8px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .info {
+            margin-top: 24px;
+            padding: 16px;
+            background: rgba(233, 69, 96, 0.1);
+            border: 1px solid rgba(233, 69, 96, 0.3);
+            border-radius: 8px;
+            font-size: 0.85rem;
+            line-height: 1.5;
+        }
+        .info a {
+            color: #e94560;
+            text-decoration: none;
+        }
+        .info a:hover { text-decoration: underline; }
+        .manual-link {
+            display: inline-block;
+            margin-top: 16px;
+            padding: 10px 24px;
+            background: #e94560;
+            color: white;
+            border-radius: 6px;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 0.95rem;
+        }
+        .manual-link:hover { background: #c73e54; }
+        .lobby-details {
+            margin-top: 16px;
+            font-size: 0.85rem;
+            color: #888;
+        }
+        .lobby-details span { color: #e0e0e0; font-weight: 600; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>MTGA Enhancement Suite</h1>
+        <p class="subtitle">Custom formats, lobby browser & more for MTG Arena</p>
+
+        <div class="status" id="status">
+            <span class="spinner"></span>
+            Opening MTGA...
+        </div>
+
+        <div class="lobby-details" id="details"></div>
+
+        <a class="manual-link" id="manualLink" style="display:none;">Click here if MTGA didn't open</a>
+
+        <div class="info">
+            <strong>Don't have the Enhancement Suite?</strong><br>
+            You need the MTGA Enhancement Suite mod installed to join custom lobbies.
+            <br><br>
+            <a href="https://github.com/MayerDaniel/MTGA-Enhancement-Suite" target="_blank">
+                Get it on GitHub &rarr;
+            </a>
+        </div>
+    </div>
+
+    <script>
+        (function() {
+            var parts = window.location.pathname.split('/').filter(Boolean);
+            // URL: /join/{challengeId}/{format}
+            var challengeId = parts[1] || '';
+            var format = parts[2] || 'none';
+
+            var schemeUrl = 'mtgaes://join/' + challengeId + '/' + format;
+
+            // Show lobby details
+            var detailsEl = document.getElementById('details');
+            if (format && format !== 'none') {
+                detailsEl.innerHTML = 'Format: <span>' + format.charAt(0).toUpperCase() + format.slice(1) + '</span>';
+            }
+
+            // Try to open the URL handler via hidden iframe (avoids navigation away from page)
+            var iframe = document.createElement('iframe');
+            iframe.style.display = 'none';
+            iframe.src = schemeUrl;
+            document.body.appendChild(iframe);
+
+            // Show manual link after a short delay
+            var manualLink = document.getElementById('manualLink');
+            manualLink.href = schemeUrl;
+
+            setTimeout(function() {
+                manualLink.style.display = 'inline-block';
+                document.getElementById('status').innerHTML =
+                    'If MTGA didn\'t open automatically, click the button below.';
+            }, 3000);
+        })();
+    </script>
+</body>
+</html>
