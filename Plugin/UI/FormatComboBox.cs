@@ -25,8 +25,9 @@ namespace MTGAEnhancementSuite.UI
         private const string GameObjectName = "MTGAES_FormatComboBox";
         private const string ListCanvasName = "MTGAES_FormatComboBoxList";
 
-        private const int MaxVisibleRows = 5;
-        private const float RowHeight = 36f;
+        private const int MaxVisibleRows = 10;
+        private const float RowHeight = 26f;
+        private const float ScrollbarWidth = 10f;
 
         private static GameObject _row;
         private static RectTransform _rowRect;
@@ -85,13 +86,23 @@ namespace MTGAEnhancementSuite.UI
             _currentIndex = index;
             if (_inputField == null) return;
 
+            var label = (index >= 0 && index < ChallengeFormatState.FormatOptions.Length)
+                ? ChallengeFormatState.FormatOptions[index]
+                : "";
+
+            // If the user typed a search query and then clicked a row, the input
+            // field is still in "edit mode" — TMP caches its display string and
+            // setting .text here doesn't visually replace what they typed.
+            // DeactivateInputField commits the field, after which .text writes
+            // through to the visible label. ForceLabelUpdate is a belt-and-
+            // suspenders rebuild for older TMP versions.
             _suppressInputChange = true;
             try
             {
-                var label = (index >= 0 && index < ChallengeFormatState.FormatOptions.Length)
-                    ? ChallengeFormatState.FormatOptions[index]
-                    : "";
+                if (_inputField.isFocused)
+                    _inputField.DeactivateInputField();
                 _inputField.text = label;
+                _inputField.ForceLabelUpdate();
             }
             finally { _suppressInputChange = false; }
 
@@ -239,16 +250,22 @@ namespace MTGAEnhancementSuite.UI
 
             var scroll = panel.AddComponent<ScrollRect>();
             scroll.horizontal = false;
-            scroll.verticalScrollbarVisibility = ScrollRect.ScrollbarVisibility.AutoHide;
+            scroll.verticalScrollbarVisibility = ScrollRect.ScrollbarVisibility.Permanent;
+            scroll.scrollSensitivity = 24f; // default 1f scrolls one pixel per wheel tick — way too slow
 
+            // Viewport leaves a strip on the right for the scrollbar
             var viewport = NewChild(panel.transform, "Viewport");
-            Stretch(viewport);
+            var vpRect = viewport.GetComponent<RectTransform>();
+            vpRect.anchorMin = Vector2.zero;
+            vpRect.anchorMax = Vector2.one;
+            vpRect.offsetMin = new Vector2(0, 0);
+            vpRect.offsetMax = new Vector2(-ScrollbarWidth, 0);
             // Image (transparent) is needed for ScrollRect drag raycasts.
             // RectMask2D handles clipping by rect bounds — unlike Mask, it
             // doesn't depend on the Image's alpha for masking shape.
             viewport.AddComponent<Image>().color = new Color(0, 0, 0, 0.001f);
             viewport.AddComponent<RectMask2D>();
-            scroll.viewport = viewport.GetComponent<RectTransform>();
+            scroll.viewport = vpRect;
 
             var content = NewChild(viewport.transform, "Content");
             var contentRect = content.GetComponent<RectTransform>();
@@ -261,11 +278,18 @@ namespace MTGAEnhancementSuite.UI
             vlg.padding = new RectOffset(0, 0, 0, 0);
             vlg.childForceExpandWidth = true;
             vlg.childForceExpandHeight = false;
-            vlg.childControlHeight = false;
+            // childControlHeight=true forces VLG to apply LayoutElement.preferredHeight
+            // to each row. With this off, rows default to RectTransform's 100×100 — which
+            // is why the rows looked massive with tiny text inside.
+            vlg.childControlHeight = true;
             vlg.childControlWidth = true;
             var fitter = content.AddComponent<ContentSizeFitter>();
             fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
             scroll.content = contentRect;
+
+            // Vertical scrollbar — pinned to the right edge of the panel
+            var scrollbar = BuildVerticalScrollbar(panel.transform);
+            scroll.verticalScrollbar = scrollbar;
 
             _listContent = content.transform;
 
@@ -325,9 +349,11 @@ namespace MTGAEnhancementSuite.UI
             float width = Mathf.Abs(brScreen.x - blScreen.x);
             if (width <= 1) return;
 
-            // Cap height at MaxVisibleRows
-            int actualRows = _listContent != null ? _listContent.childCount : 0;
-            float rowsHeight = Mathf.Max(1, Mathf.Min(actualRows, MaxVisibleRows)) * RowHeight;
+            // Always reserve MaxVisibleRows worth of height — the panel doesn't
+            // collapse when filtering returns 0 or 1 matches, and the user has
+            // a stable target to click into. Few-result frames just show empty
+            // space below the rows.
+            float rowsHeight = MaxVisibleRows * RowHeight;
 
             _listPanelRect.sizeDelta = new Vector2(width, rowsHeight);
             // ScreenSpaceOverlay panel uses pixel coords; pivot is top-left.
@@ -356,6 +382,7 @@ namespace MTGAEnhancementSuite.UI
             if (!string.IsNullOrEmpty(query) && query == currentLabel.ToLowerInvariant())
                 query = "";
 
+            int matched = 0;
             for (int i = 0; i < ChallengeFormatState.FormatKeys.Length; i++)
             {
                 var key = ChallengeFormatState.FormatKeys[i];
@@ -365,7 +392,40 @@ namespace MTGAEnhancementSuite.UI
                     !key.ToLowerInvariant().Contains(query))
                     continue;
                 CreateRow(i, key, label);
+                matched++;
             }
+
+            if (matched == 0)
+                CreateNoMatchesRow(query);
+        }
+
+        /// <summary>Adds a non-clickable "No matches" row when the search filter
+        /// rejects every entry. Keeps the dropdown looking populated.</summary>
+        private static void CreateNoMatchesRow(string query)
+        {
+            var row = new GameObject("NoMatches");
+            row.transform.SetParent(_listContent, false);
+            row.AddComponent<RectTransform>();
+            var le = row.AddComponent<LayoutElement>();
+            le.preferredHeight = RowHeight;
+            le.minHeight = RowHeight;
+            row.AddComponent<Image>().color = new Color(0.10f, 0.12f, 0.20f, 0.95f);
+
+            var nameObj = new GameObject("Name");
+            nameObj.transform.SetParent(row.transform, false);
+            var nameRect = nameObj.AddComponent<RectTransform>();
+            nameRect.anchorMin = Vector2.zero;
+            nameRect.anchorMax = Vector2.one;
+            nameRect.sizeDelta = Vector2.zero;
+            var tmp = nameObj.AddComponent<TextMeshProUGUI>();
+            tmp.text = string.IsNullOrEmpty(query) ? "No formats" : $"No matches for \"{query}\"";
+            tmp.fontSize = 20;
+            tmp.color = new Color(0.55f, 0.55f, 0.65f);
+            tmp.fontStyle = FontStyles.Italic;
+            tmp.alignment = TextAlignmentOptions.MidlineLeft;
+            tmp.margin = new Vector4(8, 0, 8, 0);
+            tmp.extraPadding = false;
+            tmp.raycastTarget = false;
         }
 
         private static void CreateRow(int index, string key, string label)
@@ -374,7 +434,8 @@ namespace MTGAEnhancementSuite.UI
             row.transform.SetParent(_listContent, false);
             row.AddComponent<RectTransform>();
             var le = row.AddComponent<LayoutElement>();
-            le.preferredHeight = 36;
+            le.preferredHeight = RowHeight;
+            le.minHeight = RowHeight;
 
             bool isCurrent = index == _currentIndex;
             row.AddComponent<Image>().color = isCurrent
@@ -397,11 +458,55 @@ namespace MTGAEnhancementSuite.UI
             nameRect.sizeDelta = Vector2.zero;
             var nameTmp = nameObj.AddComponent<TextMeshProUGUI>();
             nameTmp.text = label;
-            nameTmp.fontSize = 16;
+            nameTmp.fontSize = 22;
             nameTmp.color = Color.white;
-            nameTmp.alignment = TextAlignmentOptions.Left;
-            nameTmp.margin = new Vector4(12, 0, 12, 0);
+            nameTmp.alignment = TextAlignmentOptions.MidlineLeft;
+            nameTmp.margin = new Vector4(10, 0, 10, 0);
             nameTmp.raycastTarget = false;
+            // Strip the per-character padding TMP applies for outline rendering —
+            // we don't outline these labels, and the padding eats vertical room.
+            nameTmp.extraPadding = false;
+        }
+
+        /// <summary>
+        /// Builds a minimal vertical scrollbar (track + handle) sized to fit on
+        /// the right edge of the list panel. Returns the Scrollbar component so
+        /// the ScrollRect can wire it up.
+        /// </summary>
+        private static Scrollbar BuildVerticalScrollbar(Transform panel)
+        {
+            var sbObj = NewChild(panel, "Scrollbar");
+            var sbRect = sbObj.GetComponent<RectTransform>();
+            // Anchor to the right strip of the panel
+            sbRect.anchorMin = new Vector2(1f, 0f);
+            sbRect.anchorMax = new Vector2(1f, 1f);
+            sbRect.pivot = new Vector2(1f, 1f);
+            sbRect.sizeDelta = new Vector2(ScrollbarWidth, 0f);
+            sbRect.anchoredPosition = Vector2.zero;
+            sbObj.AddComponent<Image>().color = new Color(0.05f, 0.06f, 0.10f, 0.95f);
+
+            // Sliding area
+            var slidingArea = NewChild(sbObj.transform, "Sliding Area");
+            var saRect = slidingArea.GetComponent<RectTransform>();
+            saRect.anchorMin = Vector2.zero;
+            saRect.anchorMax = Vector2.one;
+            saRect.offsetMin = new Vector2(2, 2);
+            saRect.offsetMax = new Vector2(-2, -2);
+
+            // Handle
+            var handle = NewChild(slidingArea.transform, "Handle");
+            var hRect = handle.GetComponent<RectTransform>();
+            hRect.anchorMin = Vector2.zero;
+            hRect.anchorMax = Vector2.one;
+            hRect.sizeDelta = Vector2.zero;
+            var hImg = handle.AddComponent<Image>();
+            hImg.color = new Color(0.55f, 0.60f, 0.75f, 0.95f);
+
+            var scrollbar = sbObj.AddComponent<Scrollbar>();
+            scrollbar.targetGraphic = hImg;
+            scrollbar.handleRect = hRect;
+            scrollbar.direction = Scrollbar.Direction.BottomToTop;
+            return scrollbar;
         }
 
         // ---- helpers ----

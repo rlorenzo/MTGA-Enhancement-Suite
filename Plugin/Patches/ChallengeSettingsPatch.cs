@@ -462,7 +462,11 @@ namespace MTGAEnhancementSuite.Patches
             var sourceRect = startingPlayerSpinner.GetComponent<RectTransform>();
             float spinnerHeight = sourceRect.sizeDelta.y; // 53
             float formatY = sourceRect.anchoredPosition.y - spinnerHeight; // -219
-            float buttonsY = formatY - spinnerHeight - 10f; // -282 (extra padding)
+            // The new FormatComboBox row reads slightly taller than the
+            // original spinner (different text metrics + the inline caret),
+            // so the original 10px gap let the Copy Link / Make Public
+            // buttons clip the bottom of the format row. Bump to 30px.
+            float buttonsY = formatY - spinnerHeight - 30f; // -302
 
             // Copy Link button (left half)
             var copyLinkObj = CreateSimpleButton(parent, CopyLinkBtnName, "Copy Link",

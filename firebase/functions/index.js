@@ -1,12 +1,16 @@
 const { onRequest } = require("firebase-functions/v2/https");
 const { onSchedule: onScheduleV2 } = require("firebase-functions/v2/scheduler");
 const { onValueWritten } = require("firebase-functions/v2/database");
+const { onObjectFinalized } = require("firebase-functions/v2/storage");
 const { defineSecret } = require("firebase-functions/params");
 const admin = require("firebase-admin");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const Busboy = require("busboy");
+
+// Default Firebase Storage bucket for this project. Used by the card-db
+// upload pipeline (signed-URL request, storage trigger).
+const STORAGE_BUCKET = "mtga-enhancement-suite.firebasestorage.app";
 
 const discordWebhookUrl = defineSecret("DISCORD_WEBHOOK_URL");
 const discordPlanarStdWebhookUrl = defineSecret("DISCORD_WEBHOOK_PLANAR_STD");
@@ -20,6 +24,7 @@ const discordPauperStagingUrl = defineSecret("DISCORD_WEBHOOK_PAUPER_STAGING");
 
 admin.initializeApp({
   databaseURL: "https://mtga-enhancement-suite-default-rtdb.firebaseio.com",
+  storageBucket: STORAGE_BUCKET,
 });
 
 /**
@@ -61,6 +66,45 @@ function discordSecretsFor(env) {
 
 const SCRYFALL_SEARCH_URL = "https://api.scryfall.com/cards/search";
 const SCRYFALL_DELAY_MS = 100; // Scryfall asks for 50-100ms between requests
+
+/**
+ * Wraps fetch() with a per-attempt timeout and retry-on-network-error.
+ *
+ * Node 22's undici-based fetch has NO default request timeout — a slow or
+ * stalled Scryfall connection will hang forever, which is why createGameMode
+ * was appearing to never return. We bound each attempt with AbortSignal so a
+ * hung connection fails fast (10s), and retry up to 3 times with exponential
+ * backoff (250ms, 500ms, 1s).
+ *
+ * Total worst-case duration: 3 × 10s + 1.75s backoff ≈ 32s before giving up.
+ * Typical case is well under 1s per call.
+ */
+async function fetchWithRetry(url, options) {
+  const maxAttempts = 3;
+  const perAttemptTimeoutMs = 10000;
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fetch(url, {
+        ...(options || {}),
+        signal: AbortSignal.timeout(perAttemptTimeoutMs),
+      });
+    } catch (err) {
+      lastErr = err;
+      const reason = err.name === "TimeoutError" || err.name === "AbortError"
+        ? `timeout after ${perAttemptTimeoutMs}ms`
+        : err.message;
+      if (attempt === maxAttempts) {
+        console.warn(`fetchWithRetry: ${url} giving up after ${maxAttempts} attempts (${reason})`);
+        break;
+      }
+      const backoff = 250 * Math.pow(2, attempt - 1);
+      console.warn(`fetchWithRetry: ${url} attempt ${attempt}/${maxAttempts} failed (${reason}), retrying in ${backoff}ms`);
+      await new Promise((r) => setTimeout(r, backoff));
+    }
+  }
+  throw lastErr;
+}
 
 /**
  * Format registry — defines all supported formats.
@@ -184,7 +228,7 @@ async function syncFormatFromScryfall(format, scryfallQuery, rawQuery, filterCom
   while (hasMore) {
     const url = `${SCRYFALL_SEARCH_URL}?q=${encodeURIComponent(fullQuery)}&unique=${uniqueMode}&format=json&page=${page}`;
 
-    const response = await fetch(url);
+    const response = await fetchWithRetry(url);
 
     if (!response.ok) {
       if (response.status === 429) {
@@ -236,17 +280,23 @@ async function syncFormatFromScryfall(format, scryfallQuery, rawQuery, filterCom
     }
   }
 
-  // Second pass: unique=prints to collect ALL arena_ids across all printings.
-  // Skip if we already used unique=prints in the first pass (filterCommonPrints).
+  // Second pass: unique=prints picks up every printing's arena_id AND its
+  // printed_name / card_faces[].name. The latter is what makes Universes-
+  // Beyond crossover printings (Spider-Man flavor of "Leyline Weaver",
+  // Doctor Who flavor of <whatever>, etc.) legal — Scryfall lists them as
+  // separate prints with the same canonical card name but a printed_name
+  // matching the in-game UB face.
+  //
+  // Skip if we already used unique=prints in pass 1 (filterCommonPrints).
   if (!filterCommonPrints) {
-    console.log(`First pass done: ${totalFetched} cards. Collecting all arena_ids from prints...`);
+    console.log(`First pass done: ${totalFetched} cards. Collecting all arena_ids + printed names from prints...`);
     page = 1;
     hasMore = true;
 
     while (hasMore) {
       const url = `${SCRYFALL_SEARCH_URL}?q=${encodeURIComponent(fullQuery)}&unique=prints&format=json&page=${page}`;
 
-      const response = await fetch(url);
+      const response = await fetchWithRetry(url);
 
       if (!response.ok) {
         if (response.status === 429) {
@@ -261,12 +311,12 @@ async function syncFormatFromScryfall(format, scryfallQuery, rawQuery, filterCom
       const data = await response.json();
 
       for (const card of data.data) {
-        if (card.arena_id) {
-          if (!legalArenaIds[String(card.arena_id)]) {
-            legalArenaIds[String(card.arena_id)] = true;
-            arenaIdCount++;
-          }
-        }
+        const beforeArena = card.arena_id && !legalArenaIds[String(card.arena_id)];
+        // addCardToLists registers arena_id, the canonical name, printed_name,
+        // and every card_faces[].name (incl. printed face names for DFCs).
+        // This is what was missing previously — pass 2 only stored arena_id.
+        addCardToLists(card, legalArenaIds, legalNames);
+        if (beforeArena) arenaIdCount++;
       }
 
       hasMore = data.has_more;
@@ -497,7 +547,17 @@ exports.validateDeck = onRequest({ cors: true }, async (req, res) => {
     legalNames = namesSnap.val() || {};
   }
 
-  // --- Step 1: legality (per-card arena_id then name fallback) ---
+  // Load cardMetadata once — used for both legality fallback (faceNames)
+  // and rarity-cap min lookups in step 2.
+  const cardMeta = await getCardMetadataCache(env);
+
+  // --- Step 1: legality (per-card arena_id, then plugin-supplied name,
+  //   then every linked face name from cardMetadata) ---
+  // The faceName fallback is what handles Omenpath / Universes-Beyond
+  // crossover printings: e.g. picking the Spider-Man face of "Leyline
+  // Weaver" — the plugin sends the Spider-Man name, which Scryfall's
+  // legalNames doesn't have, but cardMetadata.cards[grpId].faceNames
+  // links it back to "leyline weaver" which Scryfall does have.
   const illegalCards = [];
   for (const card of decklist) {
     const arenaId = String(card.grpId);
@@ -507,6 +567,16 @@ exports.validateDeck = onRequest({ cors: true }, async (req, res) => {
       const encodedName = encodeFirebaseKey(card.name.toLowerCase());
       if (legalNames[encodedName]) continue;
     }
+    // Try every face name the SQLite index knows about for this grpId
+    const meta = cardMeta.cards[arenaId];
+    let legalByFace = false;
+    if (meta && Array.isArray(meta.faceNames)) {
+      for (const fn of meta.faceNames) {
+        if (legalNames[encodeFirebaseKey(fn)]) { legalByFace = true; break; }
+      }
+    }
+    if (legalByFace) continue;
+
     illegalCards.push({
       grpId: card.grpId,
       name: card.name,
@@ -526,7 +596,17 @@ exports.validateDeck = onRequest({ cors: true }, async (req, res) => {
 
   // --- Step 2: post-processing rules (rarity caps, deck size, singletons) ---
   if (mode && mode.postProcessing) {
-    const postViolations = applyPostProcessingRules(decklist, mode.postProcessing);
+    // For rarity-cap purposes, treat each card's rarity as the LOWEST rarity
+    // any of its Arena printings has — not whatever printing the player
+    // actually picked. This matches how legality works for sqlite filters
+    // (Historic Pauper allows mythic versions of cards with a common printing)
+    // and is what most "Pauper-with-rarity-caps" players expect.
+    //
+    // minRarityByName is keyed by every face name (via parseCardDb's
+    // faceNames expansion), so a deck entry that names the Spider-Man
+    // crossover face still finds the right min-rarity.
+    const postViolations = applyPostProcessingRules(
+      decklist, mode.postProcessing, cardMeta.minRarityByName, cardMeta.cards);
     violations.push(...postViolations);
   }
 
@@ -543,6 +623,64 @@ exports.validateDeck = onRequest({ cors: true }, async (req, res) => {
   }
 });
 
+// Cached card-metadata derived structures, rebuilt when /cardMetadataVersion
+// changes. Avoids re-scanning 23k cards on every deck validation.
+//
+//   cards:           parsed /cardMetadata/cards (grpId -> { name, faceNames, rarity, ... })
+//   minRarityByName: lowercase faceName -> lowest rarityValue (1-5) across
+//                    all printings of that name OR any linked face name.
+//                    So "leyline weaver" and the Spider-Man face name both
+//                    resolve to the same min rarity.
+let _cardMetaCache = null;
+let _cardMetaCacheKey = null;
+
+async function getCardMetadataCache(env) {
+  const versionSnap = await admin.database()
+    .ref(scopePath(env, "cardMetadataVersion")).once("value");
+  const currentHash = versionSnap.exists() ? versionSnap.val()?.hash : null;
+  const cacheKey = `${env}:${currentHash || "none"}`;
+
+  if (_cardMetaCacheKey === cacheKey && _cardMetaCache) {
+    return _cardMetaCache;
+  }
+
+  const cardsSnap = await admin.database()
+    .ref(scopePath(env, "cardMetadata/cards")).once("value");
+  const cards = cardsSnap.val() || {};
+
+  // RARITY_RANK matches the rarityValue ints the plugin sends (1-5).
+  const RARITY_RANK = { basic: 1, common: 2, uncommon: 3, rare: 4, mythic: 5 };
+  const minRarityByName = {};
+  for (const grpId in cards) {
+    const c = cards[grpId];
+    if (!c) continue;
+    const rank = RARITY_RANK[c.rarity];
+    if (rank === undefined) continue;
+    // Index every face name. faceNames is set by parseCardDb; old card-DB
+    // uploads didn't include it, so fall back to just c.name.
+    const names = Array.isArray(c.faceNames) && c.faceNames.length > 0
+      ? c.faceNames
+      : (c.name ? [c.name.toLowerCase()] : []);
+    for (const n of names) {
+      if (!n) continue;
+      if (!(n in minRarityByName) || rank < minRarityByName[n]) {
+        minRarityByName[n] = rank;
+      }
+    }
+  }
+
+  _cardMetaCache = { cards, minRarityByName };
+  _cardMetaCacheKey = cacheKey;
+  console.log(`[${env}] getCardMetadataCache: built (${Object.keys(cards).length} cards, ${Object.keys(minRarityByName).length} face-name keys) for hash=${currentHash || "<none>"}`);
+  return _cardMetaCache;
+}
+
+// Backwards-compat shim — older callers use getMinRarityByName directly.
+async function getMinRarityByName(env) {
+  const cache = await getCardMetadataCache(env);
+  return cache.minRarityByName;
+}
+
 /**
  * Applies post-processing rules (rarity caps, combined caps, singletons,
  * deck-size constraints) to a decklist.
@@ -550,7 +688,7 @@ exports.validateDeck = onRequest({ cors: true }, async (req, res) => {
  *
  * Decklist entries should include rarityValue (1-5) and isSideboard:bool.
  */
-function applyPostProcessingRules(decklist, rules) {
+function applyPostProcessingRules(decklist, rules, minRarityByName, cardsMeta) {
   const violations = [];
   const RARITY_LABELS = { 1: "basic", 2: "common", 3: "uncommon", 4: "rare", 5: "mythic" };
 
@@ -563,7 +701,34 @@ function applyPostProcessingRules(decklist, rules) {
   let mainSize = 0, sideSize = 0;
 
   for (const card of decklist) {
-    const rarity = RARITY_LABELS[card.rarityValue] || "unknown";
+    // Build the list of names to consult for min-rarity. Start with the
+    // plugin-supplied name; for Omenpath / Universes-Beyond cards, also
+    // include every face name from cardMetadata for this grpId.
+    const namesToTry = [];
+    if (card.name) namesToTry.push(card.name.toLowerCase());
+    if (cardsMeta && card.grpId != null) {
+      const meta = cardsMeta[String(card.grpId)];
+      if (meta && Array.isArray(meta.faceNames)) {
+        for (const fn of meta.faceNames) {
+          if (fn && namesToTry.indexOf(fn) === -1) namesToTry.push(fn);
+        }
+      }
+    }
+
+    // Effective rank = lowest rarity across all Arena printings of this card
+    // (any face name), falling back to whatever the plugin reported. So a
+    // mythic Cultivate counts as common (because Cultivate has a common
+    // printing on Arena), and a Spider-Man-flavored Leyline Weaver counts
+    // as whatever the lowest Leyline-Weaver-or-Spider-Man printing's
+    // rarity is.
+    let effectiveRank = card.rarityValue;
+    if (minRarityByName) {
+      for (const n of namesToTry) {
+        const minRank = minRarityByName[n];
+        if (minRank !== undefined && minRank < effectiveRank) effectiveRank = minRank;
+      }
+    }
+    const rarity = RARITY_LABELS[effectiveRank] || "unknown";
     const qty = Number(card.quantity || 0);
     const target = card.isSideboard ? sideCounts : mainCounts;
     if (target[rarity] !== undefined) target[rarity] += qty;
@@ -1428,17 +1593,32 @@ exports.createGameMode = onRequest({ cors: true, memory: "1GiB", timeoutSeconds:
     updatedAt: now,
   };
 
+  // Save the mode definition FIRST so user edits don't get thrown away if
+  // legality resolution fails (Scryfall blips, sqlite missing, etc.). The
+  // legalityCache is regenerated separately by /regenerateLegality on a
+  // schedule, so an empty cache is recoverable. A lost mode definition is not.
+  await admin.database().ref(scopePath(env, `gameModes/${id}`)).set(mode);
+
   // Resolve legality cache (the actual list of legal grpIds + names)
   let cache;
   try {
     cache = await resolveLegalityCache(mode, env);
   } catch (err) {
     console.error(`createGameMode: legality resolution failed for ${id}: ${err.message}`);
-    res.status(500).json({ error: `Failed to resolve legality: ${err.message}` });
+    // Mode is saved; just couldn't fetch the card list. Tell the caller
+    // explicitly so the editor can show a warning rather than thinking the
+    // submit silently failed.
+    res.status(200).json({
+      ok: true,
+      env,
+      mode,
+      totalCards: 0,
+      legalityWarning: `Mode saved, but legality resolution failed: ${err.message}. ` +
+        `Run /regenerateLegality or hit "Save" again to retry.`,
+    });
     return;
   }
 
-  await admin.database().ref(scopePath(env, `gameModes/${id}`)).set(mode);
   await admin.database().ref(scopePath(env, `legalityCache/${id}`)).set({
     legalArenaIds: cache.legalArenaIds,
     legalNames: cache.legalNames,
@@ -1609,143 +1789,263 @@ async function resolveLegalityCache(mode, env) {
 }
 
 // ===========================================================================
-// Card metadata pipeline
-// The plugin uploads the MTGA SQLite card DB whenever the local hash differs
-// from /cardMetadataVersion. We parse it here and write a normalized index
-// that the website /gamemodes editor uses for the SQLite-style rarity/set
-// selector. We don't store the .mtga file long-term — we just parse it
-// in /tmp and discard.
+// Card metadata pipeline (signed-URL flow)
+//
+// The MTGA SQLite card DB is ~226MB raw, ~62MB gzipped — far past Cloud Run's
+// 32MB inbound request cap. So we route the upload through Cloud Storage:
+//
+//   1. Plugin POSTs /requestCardDbUpload with hash + Bearer ID token. Server
+//      generates a v4 signed PUT URL for `card-db/{env}/{hash}.mtga.gz` valid
+//      for 10 minutes, and returns it.
+//   2. Plugin PUTs the gzipped DB straight to GCS (no body cap).
+//   3. parseUploadedCardDb (Storage onObjectFinalized trigger) wakes up,
+//      gunzips the object to /tmp, parses the SQLite, writes /cardMetadata
+//      and /cardMetadataVersion, then deletes the storage object.
+//
+// IAM note: for getSignedUrl() to work, the runtime service account must have
+// `roles/iam.serviceAccountTokenCreator` on itself (so it can call IAM
+// signBlob to produce v4 signatures). Run once after first deploy:
+//
+//   PROJECT_NUMBER=$(gcloud projects describe mtga-enhancement-suite \
+//       --format='value(projectNumber)')
+//   SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+//   gcloud iam service-accounts add-iam-policy-binding "$SA" \
+//       --member="serviceAccount:$SA" \
+//       --role=roles/iam.serviceAccountTokenCreator \
+//       --project=mtga-enhancement-suite
 // ===========================================================================
 
 // Maps MTGA Rarity int -> human key used in game mode rules.
 // 1=Basic Land, 2=Common, 3=Uncommon, 4=Rare, 5=Mythic.
 const RARITY_NAMES = { 1: "basic", 2: "common", 3: "uncommon", 4: "rare", 5: "mythic" };
 
+const CARD_DB_OBJECT_PREFIX = "card-db/";
+
 /**
- * Receives a multipart upload of the MTGA SQLite DB and writes a parsed
- * card-metadata index to Firebase. The plugin gates the call on a hash
- * comparison against /cardMetadataVersion to avoid redundant uploads.
- *
- * Multipart fields:
- *   hash   (text)   - 32-char hex hash from the MTGA filename
- *   db     (file)   - the .mtga SQLite file
- *
- * Query: ?env=staging routes to /staging/cardMetadata.
+ * Object path encodes env + mtgaVersion + hash so the storage trigger can
+ * reconstruct everything from the object name alone (no extra metadata).
+ *   card-db/{env}/{mtgaVersion}/{hash}.mtga.gz
  */
-exports.uploadCardDb = onRequest(
-  // Cloud Run defaults to a 32MB body limit. Gzipped MTGA card DBs are
-  // typically 30-50MB, so we lift it explicitly. memory bumped to handle
-  // ~250MB decompressed sqlite + parse.
-  { cors: true, memory: "2GiB", timeoutSeconds: 540, maxInstances: 1 },
+function cardDbObjectPath(env, mtgaVersion, hash) {
+  return `${CARD_DB_OBJECT_PREFIX}${env}/${mtgaVersion}/${hash}.mtga.gz`;
+}
+
+/** Parse "0.1.11950.1257485" -> [0, 1, 11950, 1257485]; null on bad input. */
+function parseVersion(s) {
+  if (!s || typeof s !== "string") return null;
+  const parts = s.split(".");
+  const result = [];
+  for (const p of parts) {
+    const n = parseInt(p, 10);
+    if (!Number.isFinite(n) || n < 0 || String(n) !== p.replace(/^0+(?=\d)/, "")) {
+      // Tolerate "01" but reject non-numerics
+      if (!/^\d+$/.test(p)) return null;
+    }
+    result.push(parseInt(p, 10));
+  }
+  if (result.some((n) => !Number.isFinite(n))) return null;
+  return result;
+}
+
+/** Lex-compare. null < concrete. */
+function compareVersions(a, b) {
+  if (!a && !b) return 0;
+  if (!a) return -1;
+  if (!b) return 1;
+  const len = Math.max(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    const av = i < a.length ? a[i] : 0;
+    const bv = i < b.length ? b[i] : 0;
+    if (av !== bv) return av < bv ? -1 : 1;
+  }
+  return 0;
+}
+
+/**
+ * Returns a v4 signed PUT URL for the plugin to upload the gzipped SQLite DB
+ * directly to Cloud Storage. Gates the upload on MTGA version: rejects when
+ * the caller's installed MTGA build is not strictly newer than the version
+ * already on the server (older builds must not regress newer DBs).
+ *
+ * Query/body:
+ *   hash         (string, required)  - 32-char hex hash from the MTGA filename
+ *   mtgaVersion  (string, required)  - "0.1.11950.1257485" from <install>/version
+ *   env          (string, optional)  - "staging" routes to /staging paths
+ *
+ * Auth: requires `Authorization: Bearer <Firebase ID token>`.
+ */
+exports.requestCardDbUpload = onRequest(
+  { cors: true, memory: "256MiB", timeoutSeconds: 30 },
   async (req, res) => {
-    if (req.method !== "POST") {
+    if (req.method !== "POST" && req.method !== "GET") {
       res.status(405).json({ error: "Method not allowed" });
       return;
     }
 
     const env = envFromReq(req);
 
-    // Optional auth: accept a Firebase ID token to identify the uploader.
-    // Even unauth uploads are OK for now since the data is identical for everyone.
-    let uploaderUid = null;
+    // Require a verified Firebase ID token — only authenticated MTGA+ users
+    // can request upload URLs. (Anonymous-auth users count.)
     const authHeader = req.headers.authorization || "";
-    if (authHeader.startsWith("Bearer ")) {
-      try {
-        const decoded = await admin.auth().verifyIdToken(authHeader.substring(7));
-        uploaderUid = decoded.uid;
-      } catch (err) {
-        // Ignore auth failure — proceed unauthenticated
-      }
-    }
-
-    // Compare hash query param against current server hash before we even
-    // accept the upload, so callers don't waste bandwidth.
-    const incomingHash = (req.query.hash || req.body?.hash || "").toString().trim();
-    if (!incomingHash || !/^[0-9a-fA-F]{8,64}$/.test(incomingHash)) {
-      res.status(400).json({ error: "Missing or invalid hash query param" });
+    if (!authHeader.startsWith("Bearer ")) {
+      res.status(401).json({ error: "Missing Bearer token" });
       return;
     }
+    let uploaderUid;
+    try {
+      const decoded = await admin.auth().verifyIdToken(authHeader.substring(7));
+      uploaderUid = decoded.uid;
+    } catch (err) {
+      res.status(401).json({ error: "Invalid ID token" });
+      return;
+    }
+
+    const hash = (req.query.hash || req.body?.hash || "").toString().trim().toLowerCase();
+    if (!hash || !/^[0-9a-f]{8,64}$/.test(hash)) {
+      res.status(400).json({ error: "Missing or invalid hash" });
+      return;
+    }
+
+    // mtgaVersion is required — older clients without it can't be allowed
+    // to upload because we can't tell whether their DB is newer or older.
+    const mtgaVersion = (req.query.mtgaVersion || req.body?.mtgaVersion || "").toString().trim();
+    const localParts = parseVersion(mtgaVersion);
+    if (!localParts) {
+      res.status(400).json({
+        error: "Missing or invalid mtgaVersion (expected e.g. '0.1.11950.1257485')",
+      });
+      return;
+    }
+    if (!/^[0-9.]+$/.test(mtgaVersion) || mtgaVersion.length > 64) {
+      // Defensive: object path includes this; reject anything sketchy
+      res.status(400).json({ error: "mtgaVersion contains invalid characters" });
+      return;
+    }
+
+    // Compare against current server version
+    const versionSnap = await admin.database()
+      .ref(scopePath(env, "cardMetadataVersion")).once("value");
+    const currentVersion = versionSnap.exists() ? versionSnap.val() : null;
+    const serverParts = currentVersion ? parseVersion(currentVersion.mtgaVersion) : null;
+    const cmp = compareVersions(localParts, serverParts);
+
+    if (currentVersion && cmp < 0) {
+      res.json({
+        skipped: true,
+        reason: `local MTGA ${mtgaVersion} is older than server ${currentVersion.mtgaVersion}`,
+        currentVersion,
+      });
+      return;
+    }
+    if (currentVersion && cmp === 0) {
+      // Same version. Even if the hash differs we won't accept it — the
+      // mapping is one-to-one. Reuploads of the same version are wasted work.
+      res.json({
+        skipped: true,
+        reason: "server already has this MTGA version",
+        currentVersion,
+      });
+      return;
+    }
+
+    const objectPath = cardDbObjectPath(env, mtgaVersion, hash);
+    try {
+      const [uploadUrl] = await admin.storage().bucket().file(objectPath).getSignedUrl({
+        version: "v4",
+        action: "write",
+        expires: Date.now() + 10 * 60 * 1000, // 10 minutes
+        contentType: "application/gzip",
+      });
+      console.log(`[${env}] requestCardDbUpload: issued signed URL for ${objectPath} (uploader=${uploaderUid}, server=${currentVersion?.mtgaVersion || "<none>"})`);
+      res.json({
+        ok: true,
+        env,
+        mtgaVersion,
+        uploadUrl,
+        objectPath,
+        contentType: "application/gzip",
+        expiresInSeconds: 600,
+      });
+    } catch (err) {
+      console.error(`requestCardDbUpload: failed to sign URL: ${err.message}`);
+      res.status(500).json({
+        error: "Failed to sign upload URL. Has roles/iam.serviceAccountTokenCreator " +
+               "been granted to the runtime service account? See deployment notes.",
+        detail: err.message,
+      });
+    }
+  }
+);
+
+/**
+ * Storage trigger: when a gzipped card DB lands in card-db/{env}/{hash}.mtga.gz,
+ * download, gunzip, parse, and update /cardMetadata + /cardMetadataVersion.
+ * Deletes the storage object on success so we don't accumulate stale uploads.
+ *
+ * Triggered by signed-URL writes from requestCardDbUpload.
+ */
+exports.parseUploadedCardDb = onObjectFinalized(
+  {
+    bucket: STORAGE_BUCKET,
+    region: "us-central1",
+    memory: "2GiB",
+    timeoutSeconds: 540,
+    cpu: 2,
+  },
+  async (event) => {
+    const objectName = event.data.name || "";
+    // Expected: card-db/{env}/{mtgaVersion}/{hash}.mtga.gz
+    const match = objectName.match(
+      /^card-db\/(prod|staging)\/([0-9.]+)\/([0-9a-f]{8,64})\.mtga\.gz$/
+    );
+    if (!match) {
+      console.log(`parseUploadedCardDb: ignoring unrelated object ${objectName}`);
+      return;
+    }
+    const env = match[1];
+    const incomingMtgaVersion = match[2];
+    const incomingHash = match[3];
+    const incomingParts = parseVersion(incomingMtgaVersion);
+
+    if (!incomingParts) {
+      console.warn(`parseUploadedCardDb: malformed version in path ${objectName}, deleting`);
+      try { await admin.storage().bucket().file(objectName).delete(); } catch {}
+      return;
+    }
+
+    // Race-check: another upload may have landed first. Only proceed if our
+    // version is strictly newer than the server's.
     const versionRef = admin.database().ref(scopePath(env, "cardMetadataVersion"));
     const versionSnap = await versionRef.once("value");
     const currentVersion = versionSnap.exists() ? versionSnap.val() : null;
-    if (currentVersion && currentVersion.hash === incomingHash) {
-      res.json({ skipped: true, reason: "hash matches current version", currentVersion });
+    const serverParts = currentVersion ? parseVersion(currentVersion.mtgaVersion) : null;
+    if (currentVersion && compareVersions(incomingParts, serverParts) <= 0) {
+      console.log(`[${env}] parseUploadedCardDb: server already at ${currentVersion.mtgaVersion} (incoming ${incomingMtgaVersion}), deleting redundant upload`);
+      try { await admin.storage().bucket().file(objectName).delete(); } catch {}
       return;
     }
 
-    // Parse multipart upload to /tmp.
-    // Filenames ending in .gz indicate the body was gzipped client-side
-    // (the SQLite DB is ~250MB raw but ~30-40MB gzipped, fitting in the
-    // 32MB Cloud Run body cap with a tiny buffer).
-    const upload = await new Promise((resolve, reject) => {
-      let outPath = null;
-      let isGzipped = false;
-      let originalName = null;
-      let bb;
-      try {
-        bb = Busboy({ headers: req.headers, limits: { fileSize: 200 * 1024 * 1024 } });
-      } catch (err) {
-        reject(err);
-        return;
-      }
-      bb.on("file", (fieldname, file, info) => {
-        const fname = (info && info.filename) || "";
-        const mime = (info && info.mimeType) || "";
-        isGzipped = fname.toLowerCase().endsWith(".gz") ||
-                    mime === "application/gzip" ||
-                    mime === "application/x-gzip";
-        originalName = fname.replace(/\.gz$/i, "");
-        outPath = path.join(os.tmpdir(),
-          `card-db-${Date.now()}${isGzipped ? ".gz" : ".mtga"}`);
-        const ws = fs.createWriteStream(outPath);
-        file.pipe(ws);
-        ws.on("close", () => { /* done */ });
+    const file = admin.storage().bucket().file(objectName);
+    const gzPath = path.join(os.tmpdir(), `card-db-${Date.now()}.mtga.gz`);
+    const dbPath = path.join(os.tmpdir(), `card-db-${Date.now()}.mtga`);
+
+    try {
+      console.log(`[${env}] parseUploadedCardDb: downloading ${objectName} (${event.data.size} bytes)`);
+      await file.download({ destination: gzPath });
+
+      // Decompress
+      const zlib = require("zlib");
+      await new Promise((resolve, reject) => {
+        fs.createReadStream(gzPath)
+          .pipe(zlib.createGunzip())
+          .pipe(fs.createWriteStream(dbPath))
+          .on("finish", resolve)
+          .on("error", reject);
       });
-      bb.on("error", reject);
-      bb.on("close", () => resolve({ outPath, isGzipped, originalName }));
-      if (req.rawBody) bb.end(req.rawBody);
-      else req.pipe(bb);
-    });
+      try { fs.unlinkSync(gzPath); } catch {}
 
-    let tmpFile = upload.outPath;
-    if (!tmpFile || !fs.existsSync(tmpFile)) {
-      res.status(400).json({ error: "No file uploaded (expected multipart field 'db')" });
-      return;
-    }
+      const parsed = parseCardDb(dbPath);
 
-    // If gzipped, decompress to a sibling .mtga file and free the .gz.
-    if (upload.isGzipped) {
-      try {
-        const zlib = require("zlib");
-        const decompressed = path.join(os.tmpdir(), `card-db-${Date.now()}.mtga`);
-        await new Promise((resolve, reject) => {
-          const inStream = fs.createReadStream(tmpFile);
-          const outStream = fs.createWriteStream(decompressed);
-          inStream.pipe(zlib.createGunzip()).pipe(outStream)
-            .on("finish", resolve)
-            .on("error", reject);
-        });
-        try { fs.unlinkSync(tmpFile); } catch {}
-        tmpFile = decompressed;
-        console.log(`uploadCardDb: ungzipped ${upload.originalName || "card db"} -> ${tmpFile}`);
-      } catch (err) {
-        try { fs.unlinkSync(tmpFile); } catch {}
-        res.status(400).json({ error: `Failed to decompress gzipped upload: ${err.message}` });
-        return;
-      }
-    }
-
-    let parsed;
-    try {
-      parsed = parseCardDb(tmpFile);
-    } catch (err) {
-      console.error(`Failed to parse card DB: ${err.message}`);
-      try { fs.unlinkSync(tmpFile); } catch {}
-      res.status(400).json({ error: `Failed to parse SQLite file: ${err.message}` });
-      return;
-    }
-
-    try {
       await admin.database().ref(scopePath(env, "cardMetadata")).set({
         sets: parsed.sets,
         rarities: ["basic", "common", "uncommon", "rare", "mythic"],
@@ -1755,29 +2055,39 @@ exports.uploadCardDb = onRequest(
       });
       await versionRef.set({
         hash: incomingHash,
-        uploadedBy: uploaderUid,
+        mtgaVersion: incomingMtgaVersion,
         uploadedAt: admin.database.ServerValue.TIMESTAMP,
         totalCards: Object.keys(parsed.cards).length,
       });
-      console.log(`[${env}] uploadCardDb: parsed ${Object.keys(parsed.cards).length} cards across ${parsed.sets.length} sets, hash=${incomingHash}`);
-      res.json({
-        ok: true,
-        env,
-        totalCards: Object.keys(parsed.cards).length,
-        totalSets: parsed.sets.length,
-        hash: incomingHash,
-      });
+
+      console.log(`[${env}] parseUploadedCardDb: wrote ${Object.keys(parsed.cards).length} cards, ${parsed.sets.length} sets, mtgaVersion=${incomingMtgaVersion}, hash=${incomingHash}`);
+
+      // Delete the storage object — we have everything in the database now
+      try { await file.delete(); }
+      catch (err) { console.warn(`parseUploadedCardDb: failed to delete ${objectName}: ${err.message}`); }
+    } catch (err) {
+      console.error(`parseUploadedCardDb failed for ${objectName}: ${err.stack || err.message}`);
+      throw err; // surface to Cloud Functions retry/logging
     } finally {
-      try { fs.unlinkSync(tmpFile); } catch {}
+      try { fs.unlinkSync(gzPath); } catch {}
+      try { fs.unlinkSync(dbPath); } catch {}
     }
   }
 );
 
 /**
  * Opens the MTGA SQLite card DB and produces:
- *   - cards:  { grpId: { name, rarity, set, digitalSet, isToken, isPrimary, isRebalanced } }
+ *   - cards:  { grpId: { name, rarity, set, digitalSet, isToken,
+ *                        isPrimary, isRebalanced, faceNames } }
+ *             where faceNames is the lowercase name + every linked face's
+ *               name (Omenpath/Adventure/MDFC/etc.). This is what makes
+ *               legality + rarity checks robust against Universes-Beyond
+ *               flavor names — picking the Spider-Man face of a card
+ *               named "Leyline Weaver" still resolves to the same record.
  *   - sets:   [ { code, count } ] sorted by code
- * Skips tokens and basic lands' duplicate art entries — keeps primary cards.
+ *
+ * Skips tokens. Keeps every printing (including non-primary) so rarity
+ * caps can be computed across all printings of a card name.
  */
 function parseCardDb(filePath) {
   const sqlite = require("better-sqlite3");
@@ -1790,25 +2100,59 @@ function parseCardDb(filePath) {
 
     const cardRows = db.prepare(`
       SELECT GrpId, TitleId, Rarity, ExpansionCode, DigitalReleaseSet,
-             IsToken, IsPrimaryCard, IsRebalanced, Order_Title
+             IsToken, IsPrimaryCard, IsRebalanced, Order_Title,
+             LinkedFaceType, LinkedFaceGrpIds
       FROM Cards
     `).all();
 
-    const cards = {};
-    const setCounts = {};
+    // First pass: build a raw record per grpId (we need names for linked
+    // grpIds before we can populate faceNames in the second pass).
+    const raw = {};
     for (const row of cardRows) {
-      if (row.IsToken) continue; // skip tokens
+      if (row.IsToken) continue;
       const name = enNames[row.TitleId] || row.Order_Title || `Card_${row.GrpId}`;
-      const rarity = RARITY_NAMES[row.Rarity] || "unknown";
-      cards[String(row.GrpId)] = {
+      // LinkedFaceGrpIds is a TEXT CSV column ("12345,67890" or ""). Parse
+      // defensively — tolerate unexpected types/whitespace/non-ints.
+      const linkedRaw = row.LinkedFaceGrpIds;
+      const linkedIds = (typeof linkedRaw === "string" && linkedRaw.trim() !== "")
+        ? linkedRaw.split(",")
+            .map((s) => parseInt(s.trim(), 10))
+            .filter((n) => Number.isFinite(n) && n > 0)
+        : [];
+      raw[row.GrpId] = {
         name,
-        rarity,
+        rarity: RARITY_NAMES[row.Rarity] || "unknown",
         set: row.ExpansionCode || "",
         digitalSet: row.DigitalReleaseSet || "",
         isPrimary: !!row.IsPrimaryCard,
         isRebalanced: !!row.IsRebalanced,
+        linkedFaceType: row.LinkedFaceType || 0,
+        linkedFaceGrpIds: linkedIds,
       };
-      const setKey = row.ExpansionCode || "";
+    }
+
+    // Second pass: emit final cards{} keyed by string-grpId, with faceNames
+    // expanded to include every linked face's lowercase name.
+    const cards = {};
+    const setCounts = {};
+    for (const grpIdNum in raw) {
+      const c = raw[grpIdNum];
+      const faceNames = new Set();
+      faceNames.add(c.name.toLowerCase());
+      for (const lid of c.linkedFaceGrpIds) {
+        const linked = raw[lid];
+        if (linked && linked.name) faceNames.add(linked.name.toLowerCase());
+      }
+      cards[String(grpIdNum)] = {
+        name: c.name,
+        rarity: c.rarity,
+        set: c.set,
+        digitalSet: c.digitalSet,
+        isPrimary: c.isPrimary,
+        isRebalanced: c.isRebalanced,
+        faceNames: Array.from(faceNames),
+      };
+      const setKey = c.set;
       if (setKey) setCounts[setKey] = (setCounts[setKey] || 0) + 1;
     }
 

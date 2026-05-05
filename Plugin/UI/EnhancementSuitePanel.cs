@@ -154,18 +154,27 @@ namespace MTGAEnhancementSuite.UI
             _statusText.color = new Color(0.6f, 0.6f, 0.7f);
             _statusText.alignment = TextAlignmentOptions.Left;
 
-            // Format filter row — search input + Select All / None controls + searchable chip strip
+            // Format filter — vertical scrollable checklist of game modes.
+            // Top strip has the search input + Select All / Select None.
+            // Below: a scroll list of [checkbox] [mode name] rows.
             var filterRow = CreateChild(_browserContent.transform, "FilterRow");
             var filterRowRect = filterRow.GetComponent<RectTransform>();
-            filterRowRect.anchorMin = new Vector2(0.03f, 0.69f);
+            filterRowRect.anchorMin = new Vector2(0.03f, 0.55f);
             filterRowRect.anchorMax = new Vector2(0.97f, 0.86f);
             filterRowRect.sizeDelta = Vector2.zero;
+            filterRow.AddComponent<Image>().color = new Color(0f, 0f, 0f, 0.15f);
 
-            // -- Top half: search input + Select All / Select None --
-            var searchObj = CreateChild(filterRow.transform, "FilterSearch");
+            // Header strip: search input + Select All / Select None
+            var header = CreateChild(filterRow.transform, "FilterHeader");
+            var headerRect = header.GetComponent<RectTransform>();
+            headerRect.anchorMin = new Vector2(0f, 0.78f);
+            headerRect.anchorMax = new Vector2(1f, 1f);
+            headerRect.sizeDelta = Vector2.zero;
+
+            var searchObj = CreateChild(header.transform, "FilterSearch");
             var searchRect = searchObj.GetComponent<RectTransform>();
-            searchRect.anchorMin = new Vector2(0f, 0.55f);
-            searchRect.anchorMax = new Vector2(0.55f, 0.95f);
+            searchRect.anchorMin = new Vector2(0.02f, 0.15f);
+            searchRect.anchorMax = new Vector2(0.55f, 0.85f);
             searchRect.sizeDelta = Vector2.zero;
             searchObj.AddComponent<Image>().color = new Color(0.15f, 0.15f, 0.22f, 1f);
             _filterSearchField = searchObj.AddComponent<TMP_InputField>();
@@ -200,9 +209,9 @@ namespace MTGAEnhancementSuite.UI
                 ApplyChipFilter();
             }));
 
-            // Select All / Select None
-            var selectAllBtn = CreateButton(filterRow.transform, "FilterSelectAll", "All",
-                new Vector2(0.57f, 0.55f), new Vector2(0.74f, 0.95f));
+            // Select All — clears the filter set (empty = show everything)
+            var selectAllBtn = CreateButton(header.transform, "FilterSelectAll", "Select All",
+                new Vector2(0.57f, 0.15f), new Vector2(0.77f, 0.85f));
             selectAllBtn.GetComponent<Image>().color = new Color(0.2f, 0.4f, 0.5f, 0.9f);
             selectAllBtn.GetComponent<Button>().onClick.AddListener(new UnityAction(() =>
             {
@@ -211,8 +220,9 @@ namespace MTGAEnhancementSuite.UI
                 RefreshLobbies();
             }));
 
-            var selectNoneBtn = CreateButton(filterRow.transform, "FilterSelectNone", "None",
-                new Vector2(0.76f, 0.55f), new Vector2(0.93f, 0.95f));
+            // Select None — sentinel that matches nothing
+            var selectNoneBtn = CreateButton(header.transform, "FilterSelectNone", "Select None",
+                new Vector2(0.78f, 0.15f), new Vector2(0.98f, 0.85f));
             selectNoneBtn.GetComponent<Image>().color = new Color(0.4f, 0.2f, 0.2f, 0.9f);
             selectNoneBtn.GetComponent<Button>().onClick.AddListener(new UnityAction(() =>
             {
@@ -222,45 +232,56 @@ namespace MTGAEnhancementSuite.UI
                 RefreshLobbies();
             }));
 
-            // -- Bottom half: scrollable horizontal chip strip --
-            var chipStrip = CreateChild(filterRow.transform, "ChipStrip");
-            var chipStripRect = chipStrip.GetComponent<RectTransform>();
-            chipStripRect.anchorMin = new Vector2(0f, 0f);
-            chipStripRect.anchorMax = new Vector2(1f, 0.50f);
-            chipStripRect.sizeDelta = Vector2.zero;
+            // Scrollable vertical list of [checkbox] [mode name] rows
+            var checklist = CreateChild(filterRow.transform, "FilterChecklist");
+            var checklistRect = checklist.GetComponent<RectTransform>();
+            checklistRect.anchorMin = new Vector2(0.02f, 0.05f);
+            checklistRect.anchorMax = new Vector2(0.98f, 0.76f);
+            checklistRect.sizeDelta = Vector2.zero;
 
-            var chipScroll = chipStrip.AddComponent<ScrollRect>();
-            chipScroll.horizontal = true;
-            chipScroll.vertical = false;
-            chipScroll.horizontalScrollbarVisibility = ScrollRect.ScrollbarVisibility.AutoHide;
+            var listScroll = checklist.AddComponent<ScrollRect>();
+            listScroll.horizontal = false;
+            listScroll.verticalScrollbarVisibility = ScrollRect.ScrollbarVisibility.Permanent;
 
-            var chipViewport = CreateChild(chipStrip.transform, "Viewport");
-            StretchFull(chipViewport);
-            chipViewport.AddComponent<Image>().color = new Color(0f, 0f, 0f, 0.15f);
-            chipViewport.AddComponent<Mask>().showMaskGraphic = true;
-            chipScroll.viewport = chipViewport.GetComponent<RectTransform>();
+            // Viewport leaves a 10px strip on the right for the scrollbar
+            const float filterScrollbarWidth = 10f;
+            var listViewport = CreateChild(checklist.transform, "Viewport");
+            var listVpRect = listViewport.GetComponent<RectTransform>();
+            listVpRect.anchorMin = Vector2.zero;
+            listVpRect.anchorMax = Vector2.one;
+            listVpRect.offsetMin = new Vector2(0, 0);
+            listVpRect.offsetMax = new Vector2(-filterScrollbarWidth, 0);
+            listViewport.AddComponent<Image>().color = new Color(0f, 0f, 0f, 0.001f);
+            listViewport.AddComponent<RectMask2D>();
+            listScroll.viewport = listVpRect;
 
-            var chipContent = CreateChild(chipViewport.transform, "Content");
-            var chipContentRect = chipContent.GetComponent<RectTransform>();
-            chipContentRect.anchorMin = new Vector2(0f, 0.5f);
-            chipContentRect.anchorMax = new Vector2(0f, 0.5f);
-            chipContentRect.pivot = new Vector2(0f, 0.5f);
-            chipContentRect.sizeDelta = new Vector2(0f, 0f);
+            // Build a vertical scrollbar pinned to the right edge of the checklist
+            var filterScrollbar = BuildVerticalScrollbar(checklist.transform, filterScrollbarWidth);
+            listScroll.verticalScrollbar = filterScrollbar;
 
-            var chipLayout = chipContent.AddComponent<HorizontalLayoutGroup>();
-            chipLayout.spacing = 6;
-            chipLayout.padding = new RectOffset(6, 6, 4, 4);
-            chipLayout.childForceExpandWidth = false;
-            chipLayout.childForceExpandHeight = true;
-            chipLayout.childControlWidth = false;
-            chipLayout.childControlHeight = true;
+            var filterListContent = CreateChild(listViewport.transform, "Content");
+            var filterListContentRect = filterListContent.GetComponent<RectTransform>();
+            filterListContentRect.anchorMin = new Vector2(0f, 1f);
+            filterListContentRect.anchorMax = new Vector2(1f, 1f);
+            filterListContentRect.pivot = new Vector2(0.5f, 1f);
+            filterListContentRect.sizeDelta = new Vector2(0f, 0f);
+            var filterVlg = filterListContent.AddComponent<VerticalLayoutGroup>();
+            filterVlg.spacing = 1;
+            filterVlg.padding = new RectOffset(2, 2, 0, 0);
+            filterVlg.childForceExpandWidth = true;
+            filterVlg.childForceExpandHeight = false;
+            // childControlHeight=true forces VLG to apply LayoutElement.preferredHeight
+            // to each row. With this off, rows default to RectTransform's 100×100 — which
+            // is why the rows looked massive with tiny text inside.
+            filterVlg.childControlHeight = true;
+            filterVlg.childControlWidth = true;
+            var filterFitter = filterListContent.AddComponent<ContentSizeFitter>();
+            filterFitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+            listScroll.content = filterListContentRect;
+            // Faster mouse-wheel scrolling — Unity's default of 1f feels glacial.
+            listScroll.scrollSensitivity = 24f;
 
-            var chipFitter = chipContent.AddComponent<ContentSizeFitter>();
-            chipFitter.horizontalFit = ContentSizeFitter.FitMode.PreferredSize;
-
-            chipScroll.content = chipContentRect;
-
-            // Build chips for every mode (skip the "none" sentinel and "__none__")
+            // Build a checkbox row for every mode (skip the "none" sentinel)
             var formatKeys = ChallengeFormatState.FormatKeys;
             var formatOptions = ChallengeFormatState.FormatOptions;
             _filterButtons.Clear();
@@ -270,15 +291,42 @@ namespace MTGAEnhancementSuite.UI
             {
                 var capturedKey = formatKeys[i];
                 var capturedLabel = formatOptions[i];
-                var chip = CreateChip(chipContent.transform, $"Filter_{capturedKey}", capturedLabel);
-                _filterButtons.Add(chip);
-                _filterButtonsByKey[capturedKey] = chip;
+                var rowGO = CreateChecklistRow(filterListContent.transform, $"Filter_{capturedKey}", capturedLabel);
+                _filterButtons.Add(rowGO);
+                _filterButtonsByKey[capturedKey] = rowGO;
 
-                chip.GetComponent<Button>().onClick.AddListener(new UnityAction(() =>
+                rowGO.GetComponent<Button>().onClick.AddListener(new UnityAction(() =>
                 {
+                    bool wasAllMode = !_selectedFilters.Contains("__none__") && _selectedFilters.Count == 0;
+                    bool wasNoneMode = _selectedFilters.Contains("__none__");
+
                     _selectedFilters.Remove("__none__");
-                    if (_selectedFilters.Contains(capturedKey)) _selectedFilters.Remove(capturedKey);
-                    else _selectedFilters.Add(capturedKey);
+
+                    // From "All" → unchecking one means populate everything *except*
+                    // the clicked key, so the visual matches the mental model.
+                    // From "None" → checking one starts the whitelist with just it.
+                    // From explicit list → toggle this key in/out as before.
+                    if (wasAllMode)
+                    {
+                        for (int j = 1; j < formatKeys.Length; j++)
+                            if (formatKeys[j] != capturedKey)
+                                _selectedFilters.Add(formatKeys[j]);
+                    }
+                    else if (wasNoneMode)
+                    {
+                        _selectedFilters.Add(capturedKey);
+                    }
+                    else
+                    {
+                        if (_selectedFilters.Contains(capturedKey)) _selectedFilters.Remove(capturedKey);
+                        else _selectedFilters.Add(capturedKey);
+
+                        // If user manually re-selected every individual key,
+                        // canonicalize to the empty "All" state.
+                        if (_selectedFilters.Count == formatKeys.Length - 1)
+                            _selectedFilters.Clear();
+                    }
+
                     UpdateAllFilterButtonStates();
                     RefreshLobbies();
                 }));
@@ -287,16 +335,17 @@ namespace MTGAEnhancementSuite.UI
             UpdateAllFilterButtonStates();
             ApplyChipFilter();
 
-            // Lobby list scroll area — start below the filter row
+            // Lobby list scroll area — sits below the (now taller) filter
             var scrollArea = CreateChild(_browserContent.transform, "ScrollArea");
             var scrollRect = scrollArea.GetComponent<RectTransform>();
             scrollRect.anchorMin = new Vector2(0.03f, 0.12f);
-            scrollRect.anchorMax = new Vector2(0.97f, 0.68f);
+            scrollRect.anchorMax = new Vector2(0.97f, 0.54f);
             scrollRect.sizeDelta = Vector2.zero;
 
             var scrollView = scrollArea.AddComponent<ScrollRect>();
             scrollView.horizontal = false;
             scrollView.verticalScrollbarVisibility = ScrollRect.ScrollbarVisibility.AutoHide;
+            scrollView.scrollSensitivity = 24f;
 
             var viewport = CreateChild(scrollArea.transform, "Viewport");
             StretchFull(viewport);
@@ -608,14 +657,42 @@ namespace MTGAEnhancementSuite.UI
 
         private static void UpdateAllFilterButtonStates()
         {
+            // Filter-state semantics → visual mapping:
+            //   _selectedFilters empty + no sentinel  → "All" mode → every row checked
+            //   _selectedFilters contains "__none__"  → "None" mode → every row unchecked
+            //   _selectedFilters has explicit keys    → those keys checked, others unchecked
+            // This matches user expectation: pressing "Select All" makes every checkbox
+            // appear checked; pressing "Select None" makes every checkbox appear empty.
+            bool nothingMode = _selectedFilters.Contains("__none__");
+            bool allMode = !nothingMode && _selectedFilters.Count == 0;
+
             foreach (var kvp in _filterButtonsByKey)
             {
-                var img = kvp.Value.GetComponent<Image>();
-                if (img == null) continue;
-                bool selected = _selectedFilters.Contains(kvp.Key);
-                img.color = selected
-                    ? new Color(0.3f, 0.5f, 0.7f, 0.9f)   // selected
-                    : new Color(0.15f, 0.15f, 0.25f, 0.9f); // unselected
+                var rowGO = kvp.Value;
+                if (rowGO == null) continue;
+
+                bool selected = allMode || (!nothingMode && _selectedFilters.Contains(kvp.Key));
+
+                // Subtle row background tint for the selected ones
+                var rowImg = rowGO.GetComponent<Image>();
+                if (rowImg != null)
+                    rowImg.color = selected
+                        ? new Color(0.18f, 0.28f, 0.36f, 0.9f)
+                        : new Color(0.12f, 0.12f, 0.18f, 0.7f);
+
+                // Find the checkbox children we tagged and toggle them
+                var box = rowGO.transform.Find("Checkbox");
+                if (box != null)
+                {
+                    var boxImg = box.GetComponent<Image>();
+                    if (boxImg != null)
+                        boxImg.color = selected
+                            ? new Color(0.30f, 0.55f, 0.75f, 1f)
+                            : new Color(0.10f, 0.10f, 0.14f, 1f);
+
+                    var check = box.Find("Check");
+                    if (check != null) check.gameObject.SetActive(selected);
+                }
             }
         }
 
@@ -640,6 +717,69 @@ namespace MTGAEnhancementSuite.UI
                             key.ToLowerInvariant().Contains(query);
                 chip.SetActive(show);
             }
+        }
+
+        /// <summary>
+        /// Creates one row in the vertical filter checklist:
+        ///   [☐ checkbox] [Mode display name]
+        /// Each row is itself a Button so clicking anywhere toggles selection.
+        /// The checkbox child is named "Checkbox" with a "Check" inner Image so
+        /// UpdateAllFilterButtonStates can toggle it without re-walking children.
+        /// </summary>
+        private static GameObject CreateChecklistRow(Transform parent, string name, string label)
+        {
+            var row = new GameObject(name);
+            row.transform.SetParent(parent, false);
+            row.AddComponent<RectTransform>();
+            var le = row.AddComponent<LayoutElement>();
+            le.preferredHeight = 16;
+            le.minHeight = 16;
+            row.AddComponent<Image>().color = new Color(0.12f, 0.12f, 0.18f, 0.7f);
+            row.AddComponent<Button>();
+
+            // Checkbox on the left
+            var box = new GameObject("Checkbox");
+            box.transform.SetParent(row.transform, false);
+            var boxRect = box.AddComponent<RectTransform>();
+            boxRect.anchorMin = new Vector2(0f, 0.5f);
+            boxRect.anchorMax = new Vector2(0f, 0.5f);
+            boxRect.pivot = new Vector2(0f, 0.5f);
+            boxRect.anchoredPosition = new Vector2(4f, 0f);
+            boxRect.sizeDelta = new Vector2(11f, 11f);
+            var boxImg = box.AddComponent<Image>();
+            boxImg.color = new Color(0.10f, 0.10f, 0.14f, 1f);
+            boxImg.raycastTarget = false; // let the row Button receive the click
+
+            // "Check" — a small filled square inside the checkbox shown when selected
+            var check = new GameObject("Check");
+            check.transform.SetParent(box.transform, false);
+            var checkRect = check.AddComponent<RectTransform>();
+            checkRect.anchorMin = new Vector2(0.18f, 0.18f);
+            checkRect.anchorMax = new Vector2(0.82f, 0.82f);
+            checkRect.sizeDelta = Vector2.zero;
+            var checkImg = check.AddComponent<Image>();
+            checkImg.color = new Color(1f, 1f, 1f, 0.95f);
+            checkImg.raycastTarget = false;
+            check.SetActive(false); // hidden by default; UpdateAllFilterButtonStates flips it on
+
+            // Label to the right of the checkbox
+            var textObj = new GameObject("Text");
+            textObj.transform.SetParent(row.transform, false);
+            var trect = textObj.AddComponent<RectTransform>();
+            trect.anchorMin = new Vector2(0f, 0f);
+            trect.anchorMax = new Vector2(1f, 1f);
+            trect.offsetMin = new Vector2(20f, 0f);
+            trect.offsetMax = Vector2.zero;
+            var tmp = textObj.AddComponent<TextMeshProUGUI>();
+            tmp.text = label;
+            tmp.fontSize = 14;
+            tmp.color = Color.white;
+            tmp.alignment = TextAlignmentOptions.MidlineLeft;
+            tmp.raycastTarget = false;
+            tmp.margin = Vector4.zero;
+            tmp.extraPadding = false;
+
+            return row;
         }
 
         /// <summary>
@@ -1425,6 +1565,43 @@ namespace MTGAEnhancementSuite.UI
             rect.anchorMax = Vector2.one;
             rect.sizeDelta = Vector2.zero;
             rect.anchoredPosition = Vector2.zero;
+        }
+
+        /// <summary>
+        /// Builds a small vertical scrollbar (track + handle) pinned to the right
+        /// edge of <paramref name="parent"/>. Mirrors the one in FormatComboBox.
+        /// </summary>
+        private static Scrollbar BuildVerticalScrollbar(Transform parent, float width)
+        {
+            var sbObj = CreateChild(parent, "Scrollbar");
+            var sbRect = sbObj.GetComponent<RectTransform>();
+            sbRect.anchorMin = new Vector2(1f, 0f);
+            sbRect.anchorMax = new Vector2(1f, 1f);
+            sbRect.pivot = new Vector2(1f, 1f);
+            sbRect.sizeDelta = new Vector2(width, 0f);
+            sbRect.anchoredPosition = Vector2.zero;
+            sbObj.AddComponent<Image>().color = new Color(0.05f, 0.06f, 0.10f, 0.95f);
+
+            var slidingArea = CreateChild(sbObj.transform, "Sliding Area");
+            var saRect = slidingArea.GetComponent<RectTransform>();
+            saRect.anchorMin = Vector2.zero;
+            saRect.anchorMax = Vector2.one;
+            saRect.offsetMin = new Vector2(2, 2);
+            saRect.offsetMax = new Vector2(-2, -2);
+
+            var handle = CreateChild(slidingArea.transform, "Handle");
+            var hRect = handle.GetComponent<RectTransform>();
+            hRect.anchorMin = Vector2.zero;
+            hRect.anchorMax = Vector2.one;
+            hRect.sizeDelta = Vector2.zero;
+            var hImg = handle.AddComponent<Image>();
+            hImg.color = new Color(0.55f, 0.60f, 0.75f, 0.95f);
+
+            var scrollbar = sbObj.AddComponent<Scrollbar>();
+            scrollbar.targetGraphic = hImg;
+            scrollbar.handleRect = hRect;
+            scrollbar.direction = Scrollbar.Direction.BottomToTop;
+            return scrollbar;
         }
 
         private static GameObject CreateButton(Transform parent, string name, string label,

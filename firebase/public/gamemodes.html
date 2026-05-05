@@ -585,20 +585,40 @@
         if (!body.id || !/^[a-z0-9_-]+$/.test(body.id)) { toast('Invalid ID — use lowercase letters, digits, _ and -', true); return; }
         if (!body.displayName) { toast('Display name is required', true); return; }
 
-        try {
-            var res = await fetch(`${FUNCTIONS_URL}/createGameMode?env=${ENV}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'X-MTGAES-Auth': authHash },
-                body: JSON.stringify(body),
-            });
-            var data = await res.json();
-            if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-            toast(`Saved ${body.id}: ${data.totalCards || '?'} cards legal`);
-            closeForm();
+        // The function does two things in series:
+        //   1. validate + write /gameModes/{id}                           (~1s)
+        //   2. fetch ~30 pages from Scryfall and write /legalityCache/{id} (5–10 min)
+        //
+        // We optimistically close the form and tell the user immediately —
+        // staring at a spinner for ten minutes is awful. The fetch keeps
+        // running on the server (we don't abort), and we surface the
+        // eventual result via follow-up toasts if the user is still on the
+        // page when it lands. Validation errors come back fast and still get
+        // shown via the late-toast path.
+        toast(`${body.id} submitted! Legality resolution typically takes 5–10 minutes — refresh the page later to verify it landed.`);
+        closeForm();
+        reloadModes();
+
+        fetch(`${FUNCTIONS_URL}/createGameMode?env=${ENV}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-MTGAES-Auth': authHash },
+            body: JSON.stringify(body),
+        }).then(async function (res) {
+            var data;
+            try { data = await res.json(); } catch (e) { data = {}; }
+            if (!res.ok) {
+                toast(`${body.id} save failed: ${data.error || `HTTP ${res.status}`}`, true);
+                return;
+            }
+            if (data.legalityWarning) {
+                toast(`${body.id} finished, but legality failed: ${data.legalityWarning}`, true);
+            } else if (data.totalCards != null) {
+                toast(`${body.id} legality finished: ${data.totalCards} cards legal`);
+            }
             reloadModes();
-        } catch (err) {
-            toast('Save failed: ' + err.message, true);
-        }
+        }).catch(function (err) {
+            toast(`${body.id} save errored: ${err.message || err}`, true);
+        });
     }
 
     // ===== Helpers =====

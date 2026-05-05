@@ -11,13 +11,25 @@ using UnityEngine.Networking;
 namespace MTGAEnhancementSuite.Firebase
 {
     /// <summary>
-    /// Uploads the MTGA Raw_CardDatabase_*.mtga file to the uploadCardDb Cloud Function
-    /// when the local hash differs from /cardMetadataVersion in Firebase. Runs once
-    /// per session, after authentication.
+    /// Uploads the MTGA Raw_CardDatabase_*.mtga file to Cloud Storage when the
+    /// locally-installed MTGA version is strictly newer than the version that
+    /// produced the server's /cardMetadata. Runs once per session, after auth.
     ///
-    /// The 32-character hex hash embedded in the filename (e.g.
-    /// Raw_CardDatabase_3496a613c4c9f4416ca8d7aa5b8bd47a.mtga) is the version key —
-    /// MTGA generates a new hash whenever the card DB content changes.
+    /// Why version, not hash: a user reinstalling/rolling-back to an older
+    /// build would have a different filename hash, but their DB is *older*
+    /// than what the server already has. Hash equality is necessary
+    /// (we don't re-upload identical content) but not sufficient (different
+    /// hashes don't imply newer).
+    ///
+    /// MTGA's build version lives in `<install>/version` as a JSON object:
+    ///   { "Versions": { "0.1.11950.1257485": "4/1/26" } }
+    /// The dotted number is monotonic across patches (4-component lexicographic).
+    ///
+    /// Two-step upload (the raw file is too big for Cloud Run's 32MB body cap):
+    ///   1. POST /requestCardDbUpload with hash + mtgaVersion + Bearer token.
+    ///      Function compares vs server, returns a v4 signed PUT URL or skip.
+    ///   2. PUT the gzipped bytes directly to that URL — no body cap.
+    ///   3. Storage trigger parseUploadedCardDb handles parsing.
     /// </summary>
     internal static class CardDbUploader
     {
@@ -56,13 +68,23 @@ namespace MTGAEnhancementSuite.Firebase
                 yield break;
             }
 
-            // Compare with server hash before uploading
-            string serverHash = null;
+            // Read the installed MTGA build version. If we can't, abort —
+            // we don't want to upload without a version because the server
+            // refuses unsupervised uploads.
+            string mtgaVersion = ReadInstalledMtgaVersion(dbPath);
+            if (string.IsNullOrEmpty(mtgaVersion))
+            {
+                Plugin.Log.LogWarning("CardDbUploader: could not read MTGA version from <install>/version, skipping upload");
+                yield break;
+            }
+
+            // Fetch server's current cardMetadataVersion and decide whether to upload.
+            JObject serverVersion = null;
             bool fetchDone = false;
             FirebaseClient.Instance.DatabaseGet("cardMetadataVersion", data =>
             {
                 if (data != null && data.Type == JTokenType.Object)
-                    serverHash = data["hash"]?.ToString();
+                    serverVersion = (JObject)data;
                 fetchDone = true;
             });
             float timeout = 10f;
@@ -72,14 +94,47 @@ namespace MTGAEnhancementSuite.Firebase
                 timeout -= 0.25f;
             }
 
-            if (string.Equals(hash, serverHash, StringComparison.OrdinalIgnoreCase))
+            string serverHash = serverVersion?["hash"]?.ToString();
+            string serverMtgaVersion = serverVersion?["mtgaVersion"]?.ToString();
+            var localParts = ParseVersion(mtgaVersion);
+            var serverParts = ParseVersion(serverMtgaVersion);
+
+            // Three skip cases, in order of importance:
+            //  1. Server already has the same hash AND >= our version → identical content
+            //  2. Server has a strictly newer mtgaVersion → don't regress
+            //  3. Server has the same version (regardless of hash) → don't churn
+            int versionCmp = CompareVersions(localParts, serverParts);
+
+            if (string.Equals(hash, serverHash, StringComparison.OrdinalIgnoreCase) && versionCmp <= 0)
             {
-                Plugin.Log.LogInfo($"CardDbUploader: server hash matches local ({Snippet(hash)}), skipping upload");
+                Plugin.Log.LogInfo($"CardDbUploader: server already at hash={Snippet(hash)} ver={serverMtgaVersion ?? "?"}, skipping");
                 yield break;
             }
 
-            Plugin.Log.LogInfo($"CardDbUploader: server={Snippet(serverHash) ?? "<none>"} != local={Snippet(hash)}, uploading {Path.GetFileName(dbPath)}");
+            if (serverParts != null && versionCmp < 0)
+            {
+                Plugin.Log.LogInfo($"CardDbUploader: local MTGA {mtgaVersion} is OLDER than server {serverMtgaVersion}, skipping (will not regress server)");
+                yield break;
+            }
 
+            if (serverParts != null && versionCmp == 0 && !string.Equals(hash, serverHash, StringComparison.OrdinalIgnoreCase))
+            {
+                Plugin.Log.LogInfo($"CardDbUploader: same MTGA version {mtgaVersion} but different hash (server={Snippet(serverHash)} local={Snippet(hash)}). Skipping — content tied to version.");
+                yield break;
+            }
+
+            Plugin.Log.LogInfo($"CardDbUploader: local MTGA {mtgaVersion} > server {serverMtgaVersion ?? "<none>"}, uploading {Path.GetFileName(dbPath)}");
+
+            // Step 1: Ask the function for a signed upload URL
+            string uploadUrl = null;
+            yield return RequestUploadUrl(hash, mtgaVersion, url => uploadUrl = url);
+            if (string.IsNullOrEmpty(uploadUrl))
+            {
+                Plugin.Log.LogWarning("CardDbUploader: failed to obtain signed upload URL — aborting");
+                yield break;
+            }
+
+            // Step 2: Gzip the file in memory and PUT it to the signed URL
             byte[] gzippedBytes;
             long rawSize;
             try
@@ -93,15 +148,119 @@ namespace MTGAEnhancementSuite.Firebase
                 yield break;
             }
 
-            Plugin.Log.LogInfo($"CardDbUploader: gzipped {rawSize / (1024 * 1024)}MB → {gzippedBytes.Length / (1024 * 1024)}MB");
+            Plugin.Log.LogInfo($"CardDbUploader: gzipped {rawSize / (1024 * 1024)}MB → {gzippedBytes.Length / (1024 * 1024)}MB, PUT-ing to GCS");
 
-            yield return UploadCoroutine(gzippedBytes, hash, Path.GetFileName(dbPath));
+            yield return PutToSignedUrl(uploadUrl, gzippedBytes);
+        }
+
+        // ---- Version reading & comparison ----
+
+        /// <summary>
+        /// Reads <install>/version (a JSON file) and returns the highest
+        /// MTGA build version key listed under "Versions". Format like
+        /// "0.1.11950.1257485". Returns null on any error.
+        /// </summary>
+        private static string ReadInstalledMtgaVersion(string dbPath)
+        {
+            // The version file lives at <install>/version. Two ways to find <install>:
+            //   - Application.dataPath = <install>/MTGA_Data — most reliable since we're
+            //     running inside MTGA.
+            //   - Walk up from dbPath: <install>/MTGA_Data/Downloads/Raw/Raw_*.mtga
+            try
+            {
+                string installRoot = null;
+                try
+                {
+                    var dataPath = Application.dataPath;
+                    if (!string.IsNullOrEmpty(dataPath))
+                        installRoot = Path.GetDirectoryName(dataPath);
+                }
+                catch { /* fall back below */ }
+
+                if (string.IsNullOrEmpty(installRoot) || !Directory.Exists(installRoot))
+                {
+                    // Walk up: ...\MTGA\MTGA_Data\Downloads\Raw\file.mtga -> ...\MTGA
+                    var dir = Path.GetDirectoryName(dbPath);
+                    for (int i = 0; i < 3 && !string.IsNullOrEmpty(dir); i++)
+                        dir = Path.GetDirectoryName(dir);
+                    installRoot = dir;
+                }
+
+                if (string.IsNullOrEmpty(installRoot) || !Directory.Exists(installRoot))
+                    return null;
+
+                var versionFile = Path.Combine(installRoot, "version");
+                if (!File.Exists(versionFile))
+                {
+                    Plugin.Log.LogWarning($"CardDbUploader: version file not found at {versionFile}");
+                    return null;
+                }
+
+                var json = JObject.Parse(File.ReadAllText(versionFile));
+                var versions = json["Versions"] as JObject;
+                if (versions == null || !versions.Properties().Any())
+                    return null;
+
+                // Pick the highest version key (in case there are multiple)
+                string best = null;
+                long[] bestParts = null;
+                foreach (var prop in versions.Properties())
+                {
+                    var parts = ParseVersion(prop.Name);
+                    if (parts == null) continue;
+                    if (bestParts == null || CompareVersions(parts, bestParts) > 0)
+                    {
+                        best = prop.Name;
+                        bestParts = parts;
+                    }
+                }
+                return best;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"CardDbUploader: failed to read MTGA version: {ex.Message}");
+                return null;
+            }
+        }
+
+        /// <summary>Parses "0.1.11950.1257485" into long[]; null on bad input.</summary>
+        internal static long[] ParseVersion(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return null;
+            var parts = s.Split('.');
+            var result = new long[parts.Length];
+            for (int i = 0; i < parts.Length; i++)
+            {
+                if (!long.TryParse(parts[i], out var p)) return null;
+                if (p < 0) return null;
+                result[i] = p;
+            }
+            return result;
         }
 
         /// <summary>
+        /// Lexicographic compare. Treats null as "no version" — null sorts
+        /// less than any concrete version so "first upload" beats nothing.
+        /// </summary>
+        internal static int CompareVersions(long[] a, long[] b)
+        {
+            if (a == null && b == null) return 0;
+            if (a == null) return -1;
+            if (b == null) return 1;
+            int len = Math.Max(a.Length, b.Length);
+            for (int i = 0; i < len; i++)
+            {
+                long av = i < a.Length ? a[i] : 0;
+                long bv = i < b.Length ? b[i] : 0;
+                if (av != bv) return av < bv ? -1 : 1;
+            }
+            return 0;
+        }
+
+        // ---- Networking ----
+
+        /// <summary>
         /// Reads the .mtga SQLite file and returns gzip-compressed bytes.
-        /// SQLite content compresses extremely well — typically 5-10x smaller —
-        /// which keeps us under Cloud Run's 32MB request body limit.
         /// </summary>
         private static byte[] GzipFile(string path)
         {
@@ -119,35 +278,89 @@ namespace MTGAEnhancementSuite.Firebase
             }
         }
 
-        private static IEnumerator UploadCoroutine(byte[] dbBytes, string hash, string fileName)
+        /// <summary>
+        /// Calls the requestCardDbUpload Cloud Function with the local hash +
+        /// MTGA version. Returns the signed PUT URL via callback (null on
+        /// skip/failure). Auth is the user's Firebase ID token.
+        /// </summary>
+        private static IEnumerator RequestUploadUrl(string hash, string mtgaVersion, Action<string> onResult)
         {
             var config = FirebaseConfig.Instance;
-            // The function expects .mtga.gz when Content-Encoding indicates gzip.
-            var url = config.ScopeFunctionUrl($"{config.FunctionUrl}/uploadCardDb?hash={hash}");
+            // mtgaVersion may contain dots; safe in URL but URL-encode anyway.
+            var encodedVersion = UnityWebRequest.EscapeURL(mtgaVersion);
+            var url = config.ScopeFunctionUrl(
+                $"{config.FunctionUrl}/requestCardDbUpload?hash={hash}&mtgaVersion={encodedVersion}");
 
-            var formParts = new List<IMultipartFormSection>
+            using (var request = new UnityWebRequest(url, "POST"))
             {
-                // Filename suffix .gz is the server's signal to ungzip before parsing.
-                new MultipartFormFileSection("db", dbBytes, fileName + ".gz", "application/gzip"),
-                new MultipartFormDataSection("hash", hash),
-            };
-
-            using (var request = UnityWebRequest.Post(url, formParts))
-            {
-                request.timeout = 300;
+                request.downloadHandler = new DownloadHandlerBuffer();
+                request.timeout = 30;
                 var idToken = FirebaseClient.Instance.IdToken;
                 if (!string.IsNullOrEmpty(idToken))
                     request.SetRequestHeader("Authorization", "Bearer " + idToken);
+                request.SetRequestHeader("Content-Type", "application/json");
 
                 yield return request.SendWebRequest();
 
-                if (request.responseCode == 200)
+                if (request.responseCode != 200)
                 {
-                    Plugin.Log.LogInfo($"CardDbUploader: upload succeeded: {request.downloadHandler.text}");
+                    Plugin.Log.LogWarning($"CardDbUploader: requestCardDbUpload failed (HTTP {request.responseCode}): {request.error} {request.downloadHandler?.text}");
+                    onResult?.Invoke(null);
+                    yield break;
+                }
+
+                JObject body = null;
+                try { body = JObject.Parse(request.downloadHandler.text); }
+                catch (Exception ex)
+                {
+                    Plugin.Log.LogWarning($"CardDbUploader: bad JSON from requestCardDbUpload: {ex.Message}");
+                    onResult?.Invoke(null);
+                    yield break;
+                }
+
+                if (body["skipped"]?.Value<bool>() == true)
+                {
+                    var reason = body["reason"]?.ToString() ?? "skipped";
+                    Plugin.Log.LogInfo($"CardDbUploader: server reports skip ({reason}) — not uploading");
+                    onResult?.Invoke(null);
+                    yield break;
+                }
+
+                var signed = body["uploadUrl"]?.ToString();
+                if (string.IsNullOrEmpty(signed))
+                {
+                    Plugin.Log.LogWarning($"CardDbUploader: response has no uploadUrl: {request.downloadHandler.text}");
+                    onResult?.Invoke(null);
+                    yield break;
+                }
+                onResult?.Invoke(signed);
+            }
+        }
+
+        /// <summary>
+        /// PUTs the gzipped bytes directly to a signed Cloud Storage URL.
+        /// No auth header — the URL itself authenticates. Content-Type must
+        /// match what the URL was signed with (application/gzip).
+        /// </summary>
+        private static IEnumerator PutToSignedUrl(string signedUrl, byte[] gzippedBytes)
+        {
+            using (var request = UnityWebRequest.Put(signedUrl, gzippedBytes))
+            {
+                request.timeout = 600; // up to 10 minutes for slow connections
+                request.SetRequestHeader("Content-Type", "application/gzip");
+                // Don't add an Authorization header — the URL signature IS the auth.
+
+                yield return request.SendWebRequest();
+
+                if (request.responseCode == 200 || request.responseCode == 201)
+                {
+                    Plugin.Log.LogInfo("CardDbUploader: upload succeeded — Storage trigger will parse and update /cardMetadata shortly");
                 }
                 else
                 {
-                    Plugin.Log.LogWarning($"CardDbUploader: upload failed (HTTP {request.responseCode}): {request.error} {request.downloadHandler?.text}");
+                    var truncated = request.downloadHandler?.text ?? "";
+                    if (truncated.Length > 500) truncated = truncated.Substring(0, 500) + "…";
+                    Plugin.Log.LogWarning($"CardDbUploader: PUT failed (HTTP {request.responseCode}): {request.error} {truncated}");
                 }
             }
         }
