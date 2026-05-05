@@ -18,6 +18,7 @@
   "hosting": {
     "public": "public",
     "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+    "cleanUrls": true,
     "rewrites": [
       {
         "source": "/join/**",
@@ -30,6 +31,10 @@
       {
         "source": "/gamemodes",
         "destination": "/gamemodes.html"
+      },
+      {
+        "source": "/changelog",
+        "destination": "/changelog.html"
       }
     ]
   }
