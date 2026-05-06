@@ -484,6 +484,24 @@ namespace MTGAEnhancementSuite.UI
                     Toast.Info(val ? "Card animations disabled" : "Card animations enabled");
                 });
 
+            // Export collection — opens a Windows save dialog and writes the
+            // owned cards in MTGA deck-list format. Useful for backing up
+            // the collection or pasting into deckbuilders.
+            CreateActionRow(_settingsContent.transform, "ExportCollectionRow",
+                "Export Collection",
+                "Save your owned cards to a text file (MTGA deck format) — for sharing with deckbuilders or backing up your collection.",
+                new Vector2(0.05f, 0.40f), new Vector2(0.95f, 0.53f),
+                "Export…",
+                () =>
+                {
+                    try { Features.CollectionExporter.Export(); }
+                    catch (Exception ex)
+                    {
+                        Plugin.Log.LogError($"Export collection failed: {ex}");
+                        Toast.Error("Export failed — see log");
+                    }
+                });
+
             // Settings note
             var settingsNote = CreateChild(_settingsContent.transform, "SettingsNote");
             var snRect = settingsNote.GetComponent<RectTransform>();
@@ -518,6 +536,69 @@ namespace MTGAEnhancementSuite.UI
 
             if (showBrowser)
                 RefreshLobbies();
+        }
+
+        /// <summary>
+        /// Same row layout as CreateToggle but with a single action button on
+        /// the right instead of an ON/OFF toggle. Used for one-shot settings
+        /// like "Export Collection".
+        /// </summary>
+        private static void CreateActionRow(Transform parent, string name, string label, string description,
+            Vector2 anchorMin, Vector2 anchorMax, string buttonLabel, Action onClick)
+        {
+            var row = CreateChild(parent, name);
+            var rowRect = row.GetComponent<RectTransform>();
+            rowRect.anchorMin = anchorMin;
+            rowRect.anchorMax = anchorMax;
+            rowRect.sizeDelta = Vector2.zero;
+            row.AddComponent<Image>().color = new Color(0.1f, 0.1f, 0.18f, 0.8f);
+
+            // Label
+            var labelObj = CreateChild(row.transform, "Label");
+            var labelRect = labelObj.GetComponent<RectTransform>();
+            labelRect.anchorMin = new Vector2(0.04f, 0.5f);
+            labelRect.anchorMax = new Vector2(0.7f, 1f);
+            labelRect.sizeDelta = Vector2.zero;
+            var labelTmp = labelObj.AddComponent<TextMeshProUGUI>();
+            labelTmp.text = label;
+            labelTmp.fontSize = 18;
+            labelTmp.fontStyle = FontStyles.Bold;
+            labelTmp.color = Color.white;
+            labelTmp.alignment = TextAlignmentOptions.Left;
+
+            // Description
+            var descObj = CreateChild(row.transform, "Desc");
+            var descRect = descObj.GetComponent<RectTransform>();
+            descRect.anchorMin = new Vector2(0.04f, 0f);
+            descRect.anchorMax = new Vector2(0.7f, 0.5f);
+            descRect.sizeDelta = Vector2.zero;
+            var descTmp = descObj.AddComponent<TextMeshProUGUI>();
+            descTmp.text = description;
+            descTmp.fontSize = 13;
+            descTmp.color = new Color(0.6f, 0.6f, 0.7f);
+            descTmp.alignment = TextAlignmentOptions.Left;
+
+            // Action button on the right
+            var btnObj = CreateChild(row.transform, "ActionBtn");
+            var btnRect = btnObj.GetComponent<RectTransform>();
+            btnRect.anchorMin = new Vector2(0.74f, 0.2f);
+            btnRect.anchorMax = new Vector2(0.96f, 0.8f);
+            btnRect.sizeDelta = Vector2.zero;
+            btnObj.AddComponent<Image>().color = new Color(0.3f, 0.5f, 0.7f, 0.9f);
+            var btnText = CreateChild(btnObj.transform, "Text");
+            StretchFull(btnText);
+            var btnTmp = btnText.AddComponent<TextMeshProUGUI>();
+            btnTmp.text = buttonLabel;
+            btnTmp.fontSize = 16;
+            btnTmp.fontStyle = FontStyles.Bold;
+            btnTmp.color = Color.white;
+            btnTmp.alignment = TextAlignmentOptions.Center;
+            var btn = btnObj.AddComponent<Button>();
+            btn.onClick.AddListener(new UnityEngine.Events.UnityAction(() =>
+            {
+                try { onClick?.Invoke(); }
+                catch (Exception ex) { Plugin.Log.LogError($"Action row '{label}' threw: {ex}"); }
+            }));
         }
 
         private static void CreateToggle(Transform parent, string name, string label, string description,

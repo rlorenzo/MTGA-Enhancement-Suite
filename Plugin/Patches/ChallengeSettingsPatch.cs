@@ -239,11 +239,20 @@ namespace MTGAEnhancementSuite.Patches
 
                 if (ChallengeFormatState.IsJoining) return;
 
-                ChallengeFormatState.SelectedFormat = ChallengeFormatState.FormatKeys[index];
-                Plugin.Log.LogInfo($"Format changed to: {ChallengeFormatState.SelectedFormat}");
-                PerPlayerLog.Info($"Format changed to: {ChallengeFormatState.SelectedFormat} (ActiveChallengeId={ChallengeFormatState.ActiveChallengeId}, IsJoining={ChallengeFormatState.IsJoining})");
+                var newFormat = ChallengeFormatState.FormatKeys[index];
+                // Detect "did the user actually change modes?" vs "we're just
+                // re-selecting the existing one as part of UI restore". The
+                // listener fires on every SelectOption call (including
+                // programmatic ones). Only the user-driven case should
+                // re-apply the mode's defaults (deck type, Bo3-default).
+                bool isRealChange = !string.Equals(newFormat, ChallengeFormatState.SelectedFormat,
+                    StringComparison.OrdinalIgnoreCase);
+                ChallengeFormatState.SelectedFormat = newFormat;
 
-                if (ChallengeFormatState.HasFormat)
+                Plugin.Log.LogInfo($"Format selected: {newFormat} (realChange={isRealChange})");
+                PerPlayerLog.Info($"Format selected: {newFormat} (ActiveChallengeId={ChallengeFormatState.ActiveChallengeId}, realChange={isRealChange}, IsJoining={ChallengeFormatState.IsJoining})");
+
+                if (isRealChange && ChallengeFormatState.HasFormat)
                 {
                     try { ClearSelectedDeck(widgetRef); }
                     catch (Exception ex) { Plugin.Log.LogWarning($"Could not clear deck: {ex.Message}"); }
@@ -256,8 +265,16 @@ namespace MTGAEnhancementSuite.Patches
                         ChallengeFormatState.SelectedFormat);
                     Plugin.Log.LogInfo($"Pushed format change to Firebase: {ChallengeFormatState.SelectedFormat}");
                     PerPlayerLog.Info($"Pushed format change to Firebase: {ChallengeFormatState.SelectedFormat}");
-                    PushMatchTypeForCurrentMode();
                 }
+
+                // Apply the mode's defaults (matchType + Bo3-default) on real
+                // user-driven changes regardless of whether a challenge has
+                // been created yet — PushMatchType drives MTGA's UI widgets
+                // directly when no challenge ID exists, and only commits to
+                // SetGameSettings + Firebase when one does. Skip on programmatic
+                // restores (would clobber a user's manual Bo1-on-a-Bo3-mode toggle).
+                if (!ChallengeFormatState.IsJoining && isRealChange)
+                    PushMatchTypeForCurrentMode();
 
                 UpdateButtonVisibility(parent);
             }));
@@ -711,17 +728,97 @@ namespace MTGAEnhancementSuite.Patches
         }
 
         /// <summary>
-        /// Pushes the active game mode's MatchType (e.g. DirectGame, DirectGameAlchemy)
-        /// onto the active challenge via PVPChallengeController.SetGameSettings(...).
-        /// This is what makes "60 card rebalanced" vs "60 card" actually take effect.
+        /// Applies the active game mode's match settings (deck type, Bo3-default)
+        /// in two layers:
+        ///
+        ///   (1) Always: drive MTGA's UI widgets directly via the widget's
+        ///       private SetChallengeOption_ChallengeType / _BestOfSettings
+        ///       methods. This works even before any challenge has been
+        ///       created, so the user sees the deck type and Bo toggle flip
+        ///       immediately when they pick a mode in the format dropdown.
+        ///
+        ///   (2) When a challenge exists: also call
+        ///       PVPChallengeController.SetGameSettings(...) to commit the
+        ///       same values to MTGA's challenge state, and mirror isBestOf3
+        ///       to Firebase so joiners see it via SSE.
         /// </summary>
-        private static void PushMatchTypeForCurrentMode()
+        internal static void PushMatchTypeForCurrentMode()
         {
             try
             {
                 var gameMode = ChallengeFormatState.GetGameMode(ChallengeFormatState.SelectedFormat);
                 if (gameMode == null || string.IsNullOrEmpty(gameMode.MatchType)) return;
-                if (ChallengeFormatState.ActiveChallengeId == Guid.Empty) return;
+
+                // ChallengeMatchTypes enum lives on UnifiedChallengeBladeWidget's
+                // SetChallengeOption_ChallengeType signature. Find it.
+                var widget = (_currentWidgetRef != null && _currentWidgetRef.IsAlive)
+                    ? _currentWidgetRef.Target as UnifiedChallengeBladeWidget : null;
+                if (widget == null) widget = UnityEngine.Object.FindObjectOfType<UnifiedChallengeBladeWidget>();
+
+                Type matchTypeEnum = null;
+                if (widget != null)
+                {
+                    var setChalType = AccessTools.Method(typeof(UnifiedChallengeBladeWidget),
+                        "SetChallengeOption_ChallengeType");
+                    if (setChalType != null)
+                    {
+                        var p = setChalType.GetParameters();
+                        if (p.Length > 0) matchTypeEnum = p[0].ParameterType;
+                    }
+                }
+                // Fallback: pull the enum from the controller's SetGameSettings signature.
+                if (matchTypeEnum == null && ChallengeCreatePatch.CachedControllerType != null)
+                {
+                    var sgs = AccessTools.Method(ChallengeCreatePatch.CachedControllerType, "SetGameSettings");
+                    if (sgs != null && sgs.GetParameters().Length >= 2)
+                        matchTypeEnum = sgs.GetParameters()[1].ParameterType;
+                }
+                if (matchTypeEnum == null || !matchTypeEnum.IsEnum)
+                {
+                    PerPlayerLog.Warning("PushMatchType: ChallengeMatchTypes enum not found");
+                    return;
+                }
+
+                object matchTypeValue;
+                try { matchTypeValue = Enum.Parse(matchTypeEnum, gameMode.MatchType); }
+                catch
+                {
+                    PerPlayerLog.Warning($"PushMatchType: unknown MatchType '{gameMode.MatchType}', defaulting to DirectGame");
+                    matchTypeValue = Enum.Parse(matchTypeEnum, "DirectGame");
+                }
+
+                bool desiredBestOf3 = gameMode.IsBestOf3Default;
+                ChallengeFormatState.IsBestOf3 = desiredBestOf3;
+
+                // ---- Layer 1: drive the widget's UI directly ----
+                // SetChallengeOption_ChallengeType updates the deck-type +
+                // challenge-type spinners (60-card vs 60-card-rebalanced etc.).
+                // SetChallengeOption_BestOfSettings flips the bo toggle.
+                // Both are private methods on UnifiedChallengeBladeWidget.
+                //
+                // We invoke twice — once now and once after a frame — because
+                // the very first invocation often races MTGA's own widget
+                // initialization (animator state still settling, listeners
+                // being re-bound). The second call after WaitForEndOfFrame
+                // lands after MTGA's frame has finished and reliably sticks.
+                if (widget != null)
+                {
+                    ApplyMatchTypeToWidget(widget, matchTypeValue, desiredBestOf3);
+                    FirebaseClient.Instance.StartCoroutine(
+                        ReapplyMatchTypeNextFrame(widget, matchTypeValue, desiredBestOf3,
+                            $"{gameMode.MatchType} + Bo{(desiredBestOf3 ? "3" : "1")}"));
+                }
+                else
+                {
+                    PerPlayerLog.Info("PushMatchType: no live widget — skipped UI update");
+                }
+
+                // ---- Layer 2: commit to MTGA's challenge state (only if it exists) ----
+                if (ChallengeFormatState.ActiveChallengeId == Guid.Empty)
+                {
+                    PerPlayerLog.Info("PushMatchType: no active challenge yet — UI updated only");
+                    return;
+                }
 
                 var controller = ChallengeCreatePatch.CachedController;
                 var controllerType = ChallengeCreatePatch.CachedControllerType;
@@ -738,25 +835,8 @@ namespace MTGAEnhancementSuite.Patches
                     return;
                 }
 
-                // Resolve ChallengeMatchTypes enum value from the string name
                 var paramTypes = setGameSettings.GetParameters();
-                var matchTypeEnum = paramTypes.Length >= 2 ? paramTypes[1].ParameterType : null;
                 var whoPlaysFirstEnum = paramTypes.Length >= 3 ? paramTypes[2].ParameterType : null;
-                if (matchTypeEnum == null || !matchTypeEnum.IsEnum)
-                {
-                    PerPlayerLog.Warning("PushMatchType: SetGameSettings signature unexpected");
-                    return;
-                }
-
-                object matchTypeValue;
-                try { matchTypeValue = Enum.Parse(matchTypeEnum, gameMode.MatchType); }
-                catch
-                {
-                    PerPlayerLog.Warning($"PushMatchType: unknown MatchType '{gameMode.MatchType}', defaulting to DirectGame");
-                    matchTypeValue = Enum.Parse(matchTypeEnum, "DirectGame");
-                }
-
-                // Default WhoPlaysFirst (Coinflip = 0 typically) — preserve existing if possible.
                 object whoPlaysFirstValue = whoPlaysFirstEnum != null
                     ? Enum.GetValues(whoPlaysFirstEnum).GetValue(0)
                     : null;
@@ -766,14 +846,67 @@ namespace MTGAEnhancementSuite.Patches
                     (object)ChallengeFormatState.ActiveChallengeId,
                     matchTypeValue,
                     whoPlaysFirstValue,
-                    (object)ChallengeFormatState.IsBestOf3,
+                    (object)desiredBestOf3,
                 });
-                PerPlayerLog.Info($"PushMatchType: applied {gameMode.MatchType} to challenge {ChallengeFormatState.ActiveChallengeId}");
+
+                // Mirror to Firebase so the lobby record + joiners see the new bo
+                try
+                {
+                    FirebaseClient.Instance.UpdateLobbyBestOf(
+                        ChallengeFormatState.ActiveChallengeId.ToString(), desiredBestOf3);
+                }
+                catch (Exception fbEx)
+                {
+                    Plugin.Log.LogWarning($"PushMatchType: UpdateLobbyBestOf failed: {fbEx.Message}");
+                }
+
+                PerPlayerLog.Info($"PushMatchType: committed to challenge {ChallengeFormatState.ActiveChallengeId}");
             }
             catch (Exception ex)
             {
                 Plugin.Log.LogWarning($"PushMatchType failed: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// Calls UnifiedChallengeBladeWidget.SetChallengeOption_ChallengeType +
+        /// SetChallengeOption_BestOfSettings via reflection. Pulled out so we
+        /// can invoke it both immediately and again next-frame.
+        /// </summary>
+        private static void ApplyMatchTypeToWidget(UnifiedChallengeBladeWidget widget,
+            object matchTypeValue, bool desiredBestOf3)
+        {
+            if (widget == null) return;
+            var setChalType = AccessTools.Method(typeof(UnifiedChallengeBladeWidget),
+                "SetChallengeOption_ChallengeType");
+            var setBestOf = AccessTools.Method(typeof(UnifiedChallengeBladeWidget),
+                "SetChallengeOption_BestOfSettings");
+            if (setChalType != null)
+            {
+                try { setChalType.Invoke(widget, new[] { matchTypeValue }); }
+                catch (Exception ex) { Plugin.Log.LogWarning($"SetChallengeOption_ChallengeType failed: {ex.Message}"); }
+            }
+            if (setBestOf != null)
+            {
+                try { setBestOf.Invoke(widget, new object[] { desiredBestOf3 }); }
+                catch (Exception ex) { Plugin.Log.LogWarning($"SetChallengeOption_BestOfSettings failed: {ex.Message}"); }
+            }
+        }
+
+        /// <summary>
+        /// Re-applies the match-type and best-of after one frame. The very
+        /// first invocation can race MTGA's own widget initialization
+        /// (animator transitions, OnEnable's SetSpinnersFromChallenge), so a
+        /// second pass after WaitForEndOfFrame ensures the values stick.
+        /// </summary>
+        private static IEnumerator ReapplyMatchTypeNextFrame(
+            UnifiedChallengeBladeWidget widget, object matchTypeValue,
+            bool desiredBestOf3, string label)
+        {
+            yield return new WaitForEndOfFrame();
+            if (widget == null) yield break;
+            ApplyMatchTypeToWidget(widget, matchTypeValue, desiredBestOf3);
+            PerPlayerLog.Info($"PushMatchType: UI re-applied next frame ({label})");
         }
 
         private static void ClearSelectedDeck(UnifiedChallengeBladeWidget widget)

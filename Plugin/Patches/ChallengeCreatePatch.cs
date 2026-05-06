@@ -106,6 +106,19 @@ namespace MTGAEnhancementSuite.Patches
                             ChallengeFormatState.ActiveChallengeId = cid;
                             PerPlayerLog.Info($"Got ChallengeId from widget: {cid}");
 
+                            // Now that the challenge actually exists, push the
+                            // current mode's match settings (deck type +
+                            // Bo3-default) to MTGA. The user typically picks
+                            // a format BEFORE the challenge is created, so the
+                            // spinner.onValueChanged listener was firing with
+                            // ActiveChallengeId == Guid.Empty and skipping the
+                            // SetGameSettings call entirely.
+                            try { ChallengeSettingsPatch.PushMatchTypeForCurrentMode(); }
+                            catch (Exception pmtEx)
+                            {
+                                Plugin.Log.LogWarning($"PushMatchType after challenge create failed: {pmtEx.Message}");
+                            }
+
                             // Get player info from Pantry
                             var pantryType = AccessTools.TypeByName("Pantry");
                             var accountClientType = AccessTools.TypeByName("IAccountClient");
