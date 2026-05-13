@@ -1,0 +1,279 @@
+using System;
+using System.Collections.Generic;
+using System.Reflection;
+using HarmonyLib;
+using MTGAEnhancementSuite.Features;
+using MTGAEnhancementSuite.State;
+using MTGAEnhancementSuite.UI;
+using TMPro;
+using UnityEngine;
+using Wizards.Mtga.Decks;
+
+namespace MTGAEnhancementSuite.Patches
+{
+    /// <summary>
+    /// Phase 2 of deck organization: co-opts MTGA's built-in DeckFolderView
+    /// system (the "My Decks / Starter Decks / Example Decks" expandable
+    /// sections) to render user-defined folders.
+    ///
+    /// On <see cref="DeckViewSelector.Initialize"/> postfix:
+    ///   - For each folder in DeckOrganization.Folders, instantiate the same
+    ///     _deckFolderViewPrefab MTGA uses and add it to the internal
+    ///     _deckFolders list. Wire its name + GUID.
+    ///
+    /// On <see cref="DeckViewSelector.SetDecks"/> prefix:
+    ///   - For each deck the user has assigned to one of our folders, mutate
+    ///     its DeckViewInfo.NetDeckFolderId to point at our folder's GUID.
+    ///     MTGA's existing per-folder filter then routes it to our folder
+    ///     view naturally — no parallel populate path required.
+    ///
+    /// On <see cref="DeckViewSelector.SetDecks"/> postfix:
+    ///   - Restore the NetDeckFolderId values we mutated. MTGA may reuse
+    ///     DeckViewInfo objects across calls; leaving our GUIDs in place
+    ///     would poison code paths that read NetDeckFolderId for other
+    ///     reasons.
+    /// </summary>
+    [HarmonyPatch]
+    internal static class DeckViewSelectorPatch
+    {
+        // ---- Reflection caches ----
+        private static FieldInfo _folderParentField;
+        private static FieldInfo _deckFoldersField;
+        private static FieldInfo _onDeckSelectedField;
+        private static FieldInfo _onDeckDoubleClickedField;
+        private static FieldInfo _onDeckNameEndEditField;
+
+        // Tracks DeckViewInfos whose NetDeckFolderId we've mutated this call,
+        // so the postfix can put them back. Single-call scope; cleared in
+        // the postfix even on exception.
+        private static readonly List<DeckViewInfo> _mutatedDecks = new List<DeckViewInfo>();
+
+        // Cached references to the live DeckViewSelector + the folder views
+        // we've injected. Used by RebuildUserFolders() so modal-driven
+        // mutations (CreateFolder etc.) can re-sync the UI without waiting
+        // for MTGA to re-trigger Initialize.
+        private static DeckViewSelector _instance;
+        private static readonly List<DeckFolderView> _injectedViews = new List<DeckFolderView>();
+
+        private static void EnsureReflectionCache()
+        {
+            if (_folderParentField != null) return;
+            var t = typeof(DeckViewSelector);
+            _folderParentField        = AccessTools.Field(t, "_folderParent");
+            _deckFoldersField         = AccessTools.Field(t, "_deckFolders");
+            _onDeckSelectedField      = AccessTools.Field(t, "_onDeckSelected");
+            _onDeckDoubleClickedField = AccessTools.Field(t, "_onDeckDoubleClicked");
+            _onDeckNameEndEditField   = AccessTools.Field(t, "_onDeckNameEndEdit");
+            if (_folderParentField == null || _deckFoldersField == null)
+                Plugin.Log.LogWarning("DeckViewSelectorPatch: required private fields not found via reflection");
+        }
+
+        // -----------------------------------------------------------------
+        // Initialize postfix: inject our folder views
+        // -----------------------------------------------------------------
+        [HarmonyPostfix]
+        [HarmonyPatch(typeof(DeckViewSelector), "Initialize")]
+        private static void Initialize_Postfix(DeckViewSelector __instance, bool simpleSelect)
+        {
+            // simpleSelect is the deck-picker variant used elsewhere (e.g. in
+            // challenge views) — no native folder UI, no place for ours either.
+            if (simpleSelect) return;
+
+            try
+            {
+                EnsureReflectionCache();
+                if (_folderParentField == null || _deckFoldersField == null) return;
+
+                _instance = __instance;
+                _injectedViews.Clear();
+
+                var folderParent = _folderParentField.GetValue(__instance) as Transform;
+                var deckFolders  = _deckFoldersField.GetValue(__instance) as List<DeckFolderView>;
+                if (folderParent == null || deckFolders == null) return;
+
+                // Pull the callbacks MTGA registered on its own folder views
+                // so ours get the same selection/double-click/rename behavior.
+                var onDeckSelected      = _onDeckSelectedField?.GetValue(__instance)      as Action<DeckViewInfo>;
+                var onDeckDoubleClicked = _onDeckDoubleClickedField?.GetValue(__instance) as Action<DeckViewInfo>;
+                var onDeckNameEndEdit   = _onDeckNameEndEditField?.GetValue(__instance)   as Action<DeckViewInfo, string>;
+
+                // Use the same prefab MTGA uses for its server-side folders
+                // (My Decks / Starter Decks / Example Decks). Public field.
+                var prefab = __instance._deckFolderViewPrefab;
+                if (prefab == null)
+                {
+                    Plugin.Log.LogWarning("DeckViewSelectorPatch: _deckFolderViewPrefab is null");
+                    return;
+                }
+
+                // We want user folders at the TOP — above My Decks, Starter
+                // Decks, Example Decks. Folders that already existed in
+                // _deckFolders / _folderParent at this point are MTGA's
+                // native ones; we insert ours at index 0 (and sibling
+                // index 0 in the Transform) so they sort above.
+                int injected = 0;
+                for (int i = 0; i < DeckOrganizationManager.Folders.Count; i++)
+                {
+                    var folder = DeckOrganizationManager.Folders[i];
+                    var view = UnityEngine.Object.Instantiate(prefab, folderParent);
+                    // OnFolderToggle is a private member on DeckViewSelector;
+                    // build a no-op delegate matching its signature. MTGA's
+                    // selection logic doesn't rely on it firing.
+                    view.Initialize(onDeckSelected, onDeckDoubleClicked, onDeckNameEndEdit, _ => { });
+                    view.FolderId = folder.Id;
+
+                    // Set the visible folder name. MTGA's Localize component
+                    // expects a localization key + fallback; we pass an
+                    // empty key that won't resolve so the fallback (the
+                    // user-entered folder name) is what shows.
+                    var nameLoc = view.FolderNameLocKey;
+                    if (nameLoc != null)
+                    {
+                        nameLoc.SetText("", null, folder.Name ?? "Untitled");
+                        // Defense in depth: also write the raw TMP text on
+                        // any TextMeshProUGUI under the loc component.
+                        var tmp = nameLoc.GetComponentInChildren<TextMeshProUGUI>(true);
+                        if (tmp != null) tmp.text = folder.Name ?? "Untitled";
+                    }
+
+                    // Visual order: pin user folders to the top, preserving
+                    // their own relative ordering.
+                    view.transform.SetSiblingIndex(i);
+                    // Logical order (drives SetDecks iteration): same.
+                    deckFolders.Insert(i, view);
+                    _injectedViews.Add(view);
+
+                    // Attach right-click handler so the user can rename or
+                    // delete this folder via context menu. Only user-created
+                    // folders get this; built-in folders are left alone.
+                    //
+                    // The handler has to live on the Toggle's GameObject
+                    // (the actual raycast hit target on the header) — if we
+                    // put it on the DeckFolderView's root, UGUI's event
+                    // dispatch stops at the Toggle's inherited
+                    // IPointerClickHandler and never reaches us.
+                    AttachContextHandler(view, folder.Id);
+
+                    injected++;
+                }
+
+                if (injected > 0)
+                    Plugin.Log.LogInfo($"DeckViewSelectorPatch: injected {injected} user folder view(s)");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"DeckViewSelectorPatch.Initialize_Postfix failed: {ex.Message}");
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // SetDecks prefix: temporarily mutate NetDeckFolderId so MTGA's own
+        // filter routes decks into our folder views.
+        // -----------------------------------------------------------------
+        [HarmonyPrefix]
+        [HarmonyPatch(typeof(DeckViewSelector), "SetDecks")]
+        private static void SetDecks_Prefix(System.Collections.Generic.IReadOnlyList<DeckViewInfo> decks)
+        {
+            _mutatedDecks.Clear();
+            if (decks == null) return;
+            if (DeckOrganizationManager.Folders.Count == 0) return;
+
+            // Build a deckId -> folderId map once. Linear scan over folders
+            // (handful) × DeckIds (handful per folder) is fine.
+            var assignments = new Dictionary<Guid, Guid>();
+            foreach (var folder in DeckOrganizationManager.Folders)
+                foreach (var deckId in folder.DeckIds)
+                    assignments[deckId] = folder.Id;
+
+            foreach (var d in decks)
+            {
+                if (d == null) continue;
+                // We only override decks the user explicitly assigned to one
+                // of our folders. Decks already inside a NetDeckFolder
+                // (Starter / Example / event-curated) stay where they are.
+                if (d.NetDeckFolderId.HasValue) continue;
+                if (!assignments.TryGetValue(d.deckId, out var folderId)) continue;
+                d.NetDeckFolderId = folderId;
+                _mutatedDecks.Add(d);
+            }
+        }
+
+        [HarmonyPostfix]
+        [HarmonyPatch(typeof(DeckViewSelector), "SetDecks")]
+        private static void SetDecks_Postfix()
+        {
+            // Restore. MTGA may reuse the same DeckViewInfo across calls;
+            // leaving our GUID on NetDeckFolderId would mislead other code.
+            foreach (var d in _mutatedDecks)
+                if (d != null) d.NetDeckFolderId = null;
+            _mutatedDecks.Clear();
+        }
+
+        // Attaches the right-click context menu handler to the Toggle's
+        // GameObject (where UGUI raycasts actually land) AND to every
+        // raycast-target Image in the folder header, since MTGA's header
+        // hierarchy is not entirely flat. Plus the root, as a safety net.
+        private static FieldInfo _folderToggleField;
+        private static void AttachContextHandler(DeckFolderView view, Guid folderId)
+        {
+            if (view == null) return;
+
+            void Add(GameObject go)
+            {
+                if (go == null) return;
+                var h = go.GetComponent<FolderContextMenuHandler>()
+                        ?? go.AddComponent<FolderContextMenuHandler>();
+                h.FolderId = folderId;
+            }
+
+            // 1) The DeckFolderView root (safety net).
+            Add(view.gameObject);
+
+            // 2) The Toggle's GameObject — the most reliable click target,
+            //    found via reflection on the private _folderToggle field.
+            if (_folderToggleField == null)
+                _folderToggleField = AccessTools.Field(typeof(DeckFolderView), "_folderToggle");
+            var toggle = _folderToggleField?.GetValue(view) as Component;
+            if (toggle != null) Add(toggle.gameObject);
+
+            // 3) Every Image with raycastTarget=true in the header area —
+            //    catches custom raycast surfaces MTGA might add.
+            foreach (var img in view.GetComponentsInChildren<UnityEngine.UI.Image>(true))
+                if (img.raycastTarget) Add(img.gameObject);
+        }
+
+        /// <summary>
+        /// Destroys our currently-injected DeckFolderView clones and re-runs
+        /// the injection against the current <see cref="DeckOrganization.Folders"/>.
+        /// Call after any folder-set mutation (Create, Delete, Rename, Reorder)
+        /// so newly-added folders show up without waiting for the user to leave
+        /// and re-enter the deck screen.
+        /// </summary>
+        public static void RebuildUserFolders()
+        {
+            try
+            {
+                if (_instance == null) return;
+                EnsureReflectionCache();
+                var deckFolders = _deckFoldersField?.GetValue(_instance) as List<DeckFolderView>;
+                if (deckFolders == null) return;
+
+                // Tear down old injected views.
+                foreach (var view in _injectedViews)
+                {
+                    if (view == null) continue;
+                    deckFolders.Remove(view);
+                    UnityEngine.Object.Destroy(view.gameObject);
+                }
+                _injectedViews.Clear();
+
+                // Pretend we never ran the Initialize injection — re-run it.
+                Initialize_Postfix(_instance, simpleSelect: false);
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"DeckViewSelectorPatch.RebuildUserFolders: {ex.Message}");
+            }
+        }
+    }
+}

@@ -19,6 +19,15 @@ namespace MTGAEnhancementSuite.State
         [JsonProperty("disableCardVFX")]
         public bool DisableCardVFX { get; set; } = false;
 
+        /// <summary>
+        /// User-defined deck folders + root-level ordering. Stored on-disk
+        /// in this settings file only — never in deck names, never in
+        /// MTGA's deck state, never on the wire. A user running MTGA on a
+        /// different machine without the mod sees the normal deck list.
+        /// </summary>
+        [JsonProperty("deckOrganization")]
+        public DeckOrganization DeckOrganization { get; set; } = new DeckOrganization();
+
         public static ModSettings Instance
         {
             get
@@ -48,7 +57,24 @@ namespace MTGAEnhancementSuite.State
                 {
                     var json = File.ReadAllText(path);
                     var settings = JsonConvert.DeserializeObject<ModSettings>(json);
-                    Plugin.Log.LogInfo($"Settings loaded: companions={!settings.DisableCompanions}, cardVFX={!settings.DisableCardVFX}");
+                    // Older settings files won't have a deckOrganization field;
+                    // the property initializer + Json.NET default handling
+                    // leaves it as an empty DeckOrganization, but be defensive.
+                    bool needsRewrite = false;
+                    if (settings.DeckOrganization == null)
+                    {
+                        settings.DeckOrganization = new DeckOrganization();
+                        needsRewrite = true;
+                    }
+                    // If the on-disk JSON doesn't already include the
+                    // deckOrganization key, save once so the field becomes
+                    // editable by hand. Cheap and self-healing.
+                    if (!json.Contains("\"deckOrganization\"")) needsRewrite = true;
+
+                    var folderCount = settings.DeckOrganization.Folders?.Count ?? 0;
+                    var rootOrderCount = settings.DeckOrganization.RootOrder?.Count ?? 0;
+                    Plugin.Log.LogInfo($"Settings loaded: companions={!settings.DisableCompanions}, cardVFX={!settings.DisableCardVFX}, folders={folderCount}, rootOrder={rootOrderCount}");
+                    if (needsRewrite) { _instance = settings; settings.Save(); }
                     return settings;
                 }
             }

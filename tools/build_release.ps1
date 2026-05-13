@@ -45,10 +45,31 @@ if ($LASTEXITCODE -ne 0) { throw "Installer publish failed" }
 Copy-Item Installer\publish\MTGAPlus-Installer.exe $releaseDir\MTGAPlus-Installer.exe -Force
 Write-Host ""
 
+Write-Host "=== Bundling icons ==="
+# Icon source PNGs live in assets\icons\ (tracked in git). We stage them
+# into release\icons\ for local-deploy parity with what users see, then
+# zip into release\icons.zip for distribution. They're NOT in the
+# auto-update manifest — icons rarely change and the auto-updater only
+# swaps DLLs anyway — but the fresh-install path needs them.
+$iconsSrc = Join-Path $repoRoot "assets\icons"
+$iconsStage = Join-Path $releaseDir "icons"
+$iconsZip = Join-Path $releaseDir "icons.zip"
+if (Test-Path $iconsZip)   { Remove-Item $iconsZip -Force }
+if (Test-Path $iconsStage) { Remove-Item $iconsStage -Recurse -Force }
+if (Test-Path $iconsSrc) {
+    New-Item -ItemType Directory -Path $iconsStage -Force | Out-Null
+    Copy-Item (Join-Path $iconsSrc "*.png") $iconsStage -Force
+    Compress-Archive -Path (Join-Path $iconsStage "*.png") -DestinationPath $iconsZip -Force
+    Write-Host "  icons.zip created from $iconsSrc ($(((Get-ChildItem $iconsSrc -Filter *.png).Count)) PNG(s))"
+} else {
+    Write-Host "  No assets\icons folder found; icons.zip will not be in release"
+}
+Write-Host ""
+
 Write-Host "=== Signing manifest ==="
 # manifest covers DLLs + config only — the auto-updater swaps DLLs at runtime,
 # so the installer EXE is intentionally NOT in the manifest. It's just a GitHub
-# release asset for first-time-install downloads.
+# release asset for first-time-install downloads. Same applies to icons.zip.
 python sign_release.py $Version
 if ($LASTEXITCODE -ne 0) { throw "sign_release.py failed" }
 Write-Host ""

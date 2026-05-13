@@ -128,6 +128,7 @@ try {
     $configAsset = $release.assets | Where-Object { $_.name -eq "config.json" }
     $bootstrapperAsset = $release.assets | Where-Object { $_.name -eq "MTGAESBootstrapper.dll" }
     $manifestAsset = $release.assets | Where-Object { $_.name -eq "manifest.json" }
+    $iconsAsset = $release.assets | Where-Object { $_.name -eq "icons.zip" }
 
     if (-not $dllAsset) {
         Write-Host "No MTGAEnhancementSuite.dll found in latest release. Aborting." -ForegroundColor Red
@@ -221,6 +222,21 @@ if ($bootstrapperAsset) {
         Write-Host "  Bootstrapper hash verified." -ForegroundColor Green
     }
     Write-Host "  Bootstrapper installed." -ForegroundColor Green
+}
+
+# Download icons bundle (optional — falls back to vector glyphs if absent)
+if ($iconsAsset) {
+    $iconsZipPath = Join-Path $env:TEMP "mtgaes_icons.zip"
+    $iconsDestPath = Join-Path $pluginPath "icons"
+    Write-Host "  Downloading icons..."
+    Invoke-WebRequest -Uri $iconsAsset.browser_download_url -OutFile $iconsZipPath -UseBasicParsing
+    if (-not (Test-Path $iconsDestPath)) {
+        New-Item -ItemType Directory -Path $iconsDestPath -Force | Out-Null
+    }
+    # -Force overwrites existing icons (e.g. a previous install's set)
+    Expand-Archive -Path $iconsZipPath -DestinationPath $iconsDestPath -Force
+    Remove-Item $iconsZipPath -Force
+    Write-Host "  Icons installed." -ForegroundColor Green
 }
 
 # Step 5: Register URL scheme
