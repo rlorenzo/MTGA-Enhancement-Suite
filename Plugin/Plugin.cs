@@ -109,6 +109,7 @@ namespace MTGAEnhancementSuite
             StartCoroutine(PollForNavBar());
             StartCoroutine(Patches.AuthPatch.WaitForLoginAndAuth());
             StartCoroutine(AutoUpdater.CheckForUpdate());
+            StartCoroutine(Features.IconBootstrapper.EnsureIcons());
 
             // Start named pipe server for receiving URLs from other instances
             TcpIpcServer.OnUrlReceived = OnUrlReceivedFromPipe;
@@ -448,6 +449,6 @@ namespace MTGAEnhancementSuite
     {
         public const string GUID = "com.mtgaenhancement.suite";
         public const string NAME = "MTGA Enhancement Suite";
-        public const string VERSION = "0.16.0";
+        public const string VERSION = "0.17.0";
     }
 }
