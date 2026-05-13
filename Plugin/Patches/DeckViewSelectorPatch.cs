@@ -91,9 +91,17 @@ namespace MTGAEnhancementSuite.Patches
                 var deckFolders  = _deckFoldersField.GetValue(__instance) as List<DeckFolderView>;
                 if (folderParent == null || deckFolders == null) return;
 
-                // Pull the callbacks MTGA registered on its own folder views
-                // so ours get the same selection/double-click/rename behavior.
-                var onDeckSelected      = _onDeckSelectedField?.GetValue(__instance)      as Action<DeckViewInfo>;
+                // The click handler we wire into our folder views must be
+                // DeckViewSelector.SelectDeck (the method) — that's what
+                // MTGA's own folders use. SelectDeck does the per-folder
+                // SetIsSelected(true) (the deck-box-open animation on the
+                // clicked tile) and THEN invokes _onDeckSelected (the
+                // caller's callback). Wiring our folders directly to
+                // _onDeckSelected skips the animation step.
+                //
+                // The DeckViewInfo overload of SelectDeck is the one that
+                // does the animation; the string overload just defers to it.
+                var onDeckSelected      = new Action<DeckViewInfo>(__instance.SelectDeck);
                 var onDeckDoubleClicked = _onDeckDoubleClickedField?.GetValue(__instance) as Action<DeckViewInfo>;
                 var onDeckNameEndEdit   = _onDeckNameEndEditField?.GetValue(__instance)   as Action<DeckViewInfo, string>;
 
