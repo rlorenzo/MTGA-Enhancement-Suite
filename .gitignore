@@ -60,3 +60,8 @@ CLAUDE.md
 MsiInstaller/stage/
 MsiInstaller/*.wixpdb
 MsiInstaller/obj/
+
+# Mac IL2CPP spike: large downloads, staged game copy, generated interop assemblies
+mac-spike/bepinex/
+mac-spike/staging/
+mac-spike/interop/
