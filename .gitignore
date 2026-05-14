@@ -55,3 +55,8 @@ context/
 release/
 firebase/.firebase/
 CLAUDE.md
+
+# Mac IL2CPP spike: large downloads, staged game copy, generated interop assemblies
+mac-spike/bepinex/
+mac-spike/staging/
+mac-spike/interop/
