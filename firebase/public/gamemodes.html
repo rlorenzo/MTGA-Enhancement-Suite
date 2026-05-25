@@ -372,6 +372,16 @@
                             <div class="help">Any valid Scryfall query. Cards matching this set the legal pool. Best for paper-format-based modes.</div>
                         </div>
                     </div>
+                    <div class="form-row">
+                        <label>Rarity for caps</label>
+                        <div>
+                            <label style="display:flex;align-items:center;gap:8px;color:#ddd;font-weight:normal;cursor:pointer;">
+                                <input type="checkbox" id="f-useFormatRarity" ${(ls.type === 'scryfall' && ls.useFormatRarity) ? 'checked' : ''}>
+                                Use this format's rarity for rarity caps
+                            </label>
+                            <div class="help">When ON, rarity caps count each card by its rarity in the printings this query matches (e.g. its current Standard printing) — captured from Scryfall. When OFF (default), a card counts as the lowest rarity it has ever had on Arena. Turn this ON for Standard-based budget modes like Gentry, where a card that's only uncommon in Standard shouldn't slip through as a common just because an old common printing exists. Only applies to Scryfall-query modes.</div>
+                        </div>
+                    </div>
                 </div>
 
                 <div class="tab-pane ${ls.type === 'sqlite' ? 'active' : ''}" id="tab-sqlite">
@@ -530,6 +540,7 @@
             legalitySource = {
                 type: 'scryfall',
                 query: document.getElementById('f-scryfall-query').value.trim(),
+                useFormatRarity: document.getElementById('f-useFormatRarity').checked,
             };
             if (!legalitySource.query) { toast('Scryfall query is required', true); return; }
         } else {

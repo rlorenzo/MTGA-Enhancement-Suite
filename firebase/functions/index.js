@@ -200,16 +200,24 @@ async function syncAllFormats(env = "prod") {
  * Fetches all cards legal in a format that exist on Arena from Scryfall,
  * then writes the arena_id -> card name mapping to Firebase.
  */
-async function syncFormatFromScryfall(format, scryfallQuery, rawQuery, filterCommonPrints, env = "prod") {
+async function syncFormatFromScryfall(format, scryfallQuery, rawQuery, filterCommonPrints, env = "prod", captureRarity = false) {
   const query = scryfallQuery || `legal:${format}`;
   // rawQuery means the query already includes game: filter — don't append game:arena
   const fullQuery = rawQuery ? query : `${query} game:arena`;
-  console.log(`Starting ${format} sync from Scryfall (query: ${fullQuery}, filterCommon: ${!!filterCommonPrints})...`);
+  console.log(`Starting ${format} sync from Scryfall (query: ${fullQuery}, filterCommon: ${!!filterCommonPrints}, captureRarity: ${!!captureRarity})...`);
 
   // Dual storage: arena_ids for language-independent checks,
   // names as fallback for cards without arena_ids (e.g. om1 crossover cards)
   const legalArenaIds = {}; // arena_id (string) -> true
   const legalNames = {};    // lowercase card name -> true
+  // When captureRarity is set, record each card's rarity from the
+  // unique=cards pass (encoded name -> rank). This is the card's rarity in
+  // the *format's* legal printings (e.g. its current Standard printing),
+  // which differs from the lowest-rarity-ever-printed value the global
+  // cardMetadata index produces. Used by "Gentry"-style modes where a card
+  // that's uncommon in Standard shouldn't count as common just because an
+  // old/rotated common Arena printing exists. See addCardRarity.
+  const rarityByName = {}; // encoded lowercase name -> rank (2-5)
   let page = 1;
   let hasMore = true;
   let totalFetched = 0;
@@ -255,6 +263,10 @@ async function syncFormatFromScryfall(format, scryfallQuery, rawQuery, filterCom
         // Original behavior: add all cards directly
         addCardToLists(card, legalArenaIds, legalNames);
         arenaIdCount += (card.arena_id ? 1 : 0);
+        // unique=cards returns one representative print per card — for a
+        // legal:standard query that's the current Standard-set printing, so
+        // its rarity is the format rarity we want.
+        if (captureRarity) addCardRarity(card, rarityByName);
       }
     }
 
@@ -276,6 +288,11 @@ async function syncFormatFromScryfall(format, scryfallQuery, rawQuery, filterCom
       for (const card of cards) {
         addCardToLists(card, legalArenaIds, legalNames);
         arenaIdCount += (card.arena_id ? 1 : 0);
+        // filterCommonPrints uses unique=prints, so we see every printing.
+        // addCardRarity keeps the *lowest* rank seen, which is the right
+        // fallback if a format ever combines filterCommonPrints with
+        // captureRarity (commons-only modes don't normally need it).
+        if (captureRarity) addCardRarity(card, rarityByName);
       }
     }
   }
@@ -342,6 +359,7 @@ async function syncFormatFromScryfall(format, scryfallQuery, rawQuery, filterCom
     totalArenaIds: arenaIdCount,
     totalNames: Object.keys(legalNames).length,
   };
+  if (captureRarity) update.rarityByName = rarityByName;
 
   await admin.database().ref(scopePath(env, `formats/${format}`)).set(update);
 
@@ -350,6 +368,7 @@ async function syncFormatFromScryfall(format, scryfallQuery, rawQuery, filterCom
     totalCards: uniqueCards,
     totalPrints: totalFetched,
     syncedAt: new Date().toISOString(),
+    rarityByName: captureRarity ? rarityByName : null,
   };
 
   console.log(`${format} sync complete:`, result);
@@ -395,6 +414,56 @@ function addCardToLists(card, legalArenaIds, legalNames) {
       if (face.printed_name) {
         legalNames[encodeFirebaseKey(face.printed_name.toLowerCase())] = true;
       }
+    }
+  }
+}
+
+// Scryfall rarity string -> numeric rank, matching the rarityValue ints the
+// plugin sends and the RARITY_LABELS map in applyPostProcessingRules.
+// "special" / "bonus" are oddball Scryfall rarities (e.g. The List, serialized
+// cards); map them to the nearest sensible rank so a stray printing doesn't
+// throw off the cap math.
+const SCRYFALL_RARITY_RANK = {
+  common: 2, uncommon: 3, rare: 4, mythic: 5, special: 4, bonus: 5,
+};
+
+/**
+ * Records a Scryfall card's rarity into rarityByName, keyed by the same
+ * encoded name variants addCardToLists registers (canonical, faces,
+ * printed_name, card_faces). Keeps the LOWEST rank seen for a given name so
+ * multi-print captures (filterCommonPrints) collapse to the most lenient
+ * rarity. Keys are encoded with encodeFirebaseKey so they're Firebase-safe
+ * and match the lookups in applyPostProcessingRules.
+ */
+function addCardRarity(card, rarityByName) {
+  const rank = SCRYFALL_RARITY_RANK[card.rarity];
+  if (rank === undefined) return;
+
+  const names = [];
+  const name = card.name.toLowerCase();
+  names.push(name);
+  if (name.includes(" // ")) {
+    for (const face of name.split(" // ")) names.push(face.trim());
+  }
+  if (card.printed_name) {
+    const printedName = card.printed_name.toLowerCase();
+    names.push(printedName);
+    if (printedName.includes(" // ")) {
+      for (const face of printedName.split(" // ")) names.push(face.trim());
+    }
+  }
+  if (card.card_faces) {
+    for (const face of card.card_faces) {
+      if (face.name) names.push(face.name.toLowerCase());
+      if (face.printed_name) names.push(face.printed_name.toLowerCase());
+    }
+  }
+
+  for (const n of names) {
+    if (!n) continue;
+    const key = encodeFirebaseKey(n);
+    if (!(key in rarityByName) || rank < rarityByName[key]) {
+      rarityByName[key] = rank;
     }
   }
 }
@@ -522,6 +591,9 @@ exports.validateDeck = onRequest({ cors: true }, async (req, res) => {
   let mode = null;
   let legalArenaIds = null;
   let legalNames = null;
+  // Format-rarity map (encoded name -> rank). Only populated for modes that
+  // opted into useFormatRarity; null means "fall back to global Arena min".
+  let formatRarityByName = null;
   const [modeSnap, cacheSnap] = await Promise.all([
     admin.database().ref(scopePath(env, `gameModes/${modeId}`)).once("value"),
     admin.database().ref(scopePath(env, `legalityCache/${modeId}`)).once("value"),
@@ -531,6 +603,14 @@ exports.validateDeck = onRequest({ cors: true }, async (req, res) => {
     const c = cacheSnap.val();
     legalArenaIds = c.legalArenaIds || {};
     legalNames = c.legalNames || {};
+    // Use the cached format-rarity map only when the mode is currently
+    // configured for it (a scryfall mode with the flag on). Guarding on the
+    // mode flag means toggling the checkbox off takes effect immediately
+    // even before the cache is regenerated.
+    if (mode.legalitySource && mode.legalitySource.type === "scryfall" &&
+        mode.legalitySource.useFormatRarity) {
+      formatRarityByName = c.rarityByName || null;
+    }
   } else {
     // Legacy fallback: read /formats/{modeId}
     const [idsSnap, namesSnap] = await Promise.all([
@@ -596,17 +676,25 @@ exports.validateDeck = onRequest({ cors: true }, async (req, res) => {
 
   // --- Step 2: post-processing rules (rarity caps, deck size, singletons) ---
   if (mode && mode.postProcessing) {
-    // For rarity-cap purposes, treat each card's rarity as the LOWEST rarity
-    // any of its Arena printings has — not whatever printing the player
-    // actually picked. This matches how legality works for sqlite filters
-    // (Historic Pauper allows mythic versions of cards with a common printing)
-    // and is what most "Pauper-with-rarity-caps" players expect.
+    // Two rarity-resolution modes:
     //
-    // minRarityByName is keyed by every face name (via parseCardDb's
-    // faceNames expansion), so a deck entry that names the Spider-Man
-    // crossover face still finds the right min-rarity.
+    //   Default (formatRarityByName == null): treat each card's rarity as the
+    //   LOWEST rarity any of its Arena printings has — not whatever printing
+    //   the player picked. Matches sqlite filters (Historic Pauper allows the
+    //   mythic version of a card with a common printing) and is what most
+    //   "Pauper-with-rarity-caps" players expect.
+    //
+    //   Format rarity (formatRarityByName set): use the card's rarity in this
+    //   format's legal printings (its current Standard printing), captured
+    //   from the Scryfall unique=cards pass. This is for Gentry-style modes
+    //   where a card that's uncommon in Standard must NOT count as common just
+    //   because an old/rotated common Arena printing exists.
+    //
+    // Both maps are keyed by every face name so Omenpath / Universes-Beyond
+    // crossover faces resolve correctly.
     const postViolations = applyPostProcessingRules(
-      decklist, mode.postProcessing, cardMeta.minRarityByName, cardMeta.cards);
+      decklist, mode.postProcessing, cardMeta.minRarityByName, cardMeta.cards,
+      formatRarityByName);
     violations.push(...postViolations);
   }
 
@@ -688,7 +776,7 @@ async function getMinRarityByName(env) {
  *
  * Decklist entries should include rarityValue (1-5) and isSideboard:bool.
  */
-function applyPostProcessingRules(decklist, rules, minRarityByName, cardsMeta) {
+function applyPostProcessingRules(decklist, rules, minRarityByName, cardsMeta, formatRarityByName = null) {
   const violations = [];
   const RARITY_LABELS = { 1: "basic", 2: "common", 3: "uncommon", 4: "rare", 5: "mythic" };
 
@@ -715,14 +803,30 @@ function applyPostProcessingRules(decklist, rules, minRarityByName, cardsMeta) {
       }
     }
 
-    // Effective rank = lowest rarity across all Arena printings of this card
-    // (any face name), falling back to whatever the plugin reported. So a
-    // mythic Cultivate counts as common (because Cultivate has a common
-    // printing on Arena), and a Spider-Man-flavored Leyline Weaver counts
-    // as whatever the lowest Leyline-Weaver-or-Spider-Man printing's
-    // rarity is.
+    // Determine the rarity rank used for cap math.
     let effectiveRank = card.rarityValue;
-    if (minRarityByName) {
+    if (formatRarityByName) {
+      // Format-rarity (override) mode: the card's rarity in this format's
+      // legal printings is authoritative. We do NOT fold in card.rarityValue
+      // or the global Arena min — that's the whole point: a card that's
+      // uncommon in Standard stays uncommon even if a common Arena printing
+      // exists. Keys are encodeFirebaseKey'd, so encode each name to match.
+      // If a name maps to multiple ranks (e.g. legal at both common and
+      // uncommon within the format), take the lowest — most lenient.
+      let found;
+      for (const n of namesToTry) {
+        const r = formatRarityByName[encodeFirebaseKey(n)];
+        if (r !== undefined && (found === undefined || r < found)) found = r;
+      }
+      // Fall back to the plugin-reported rarity only if the card isn't in the
+      // format map at all (shouldn't happen for legal cards, but defensive).
+      if (found !== undefined) effectiveRank = found;
+    } else if (minRarityByName) {
+      // Default mode: lowest rarity across all Arena printings of this card
+      // (any face name), falling back to whatever the plugin reported. So a
+      // mythic Cultivate counts as common (Cultivate has a common Arena
+      // printing), and a Spider-Man-flavored Leyline Weaver counts as the
+      // lowest Leyline-Weaver-or-Spider-Man printing's rarity.
       for (const n of namesToTry) {
         const minRank = minRarityByName[n];
         if (minRank !== undefined && minRank < effectiveRank) effectiveRank = minRank;
@@ -1622,6 +1726,7 @@ exports.createGameMode = onRequest({ cors: true, memory: "1GiB", timeoutSeconds:
   await admin.database().ref(scopePath(env, `legalityCache/${id}`)).set({
     legalArenaIds: cache.legalArenaIds,
     legalNames: cache.legalNames,
+    rarityByName: cache.rarityByName || null,
     totalCards: cache.totalCards,
     syncedAt: now,
   });
@@ -1690,6 +1795,7 @@ exports.regenerateLegality = onRequest(
         await admin.database().ref(scopePath(env, `legalityCache/${id}`)).set({
           legalArenaIds: cache.legalArenaIds,
           legalNames: cache.legalNames,
+          rarityByName: cache.rarityByName || null,
           totalCards: cache.totalCards,
           syncedAt: Date.now(),
         });
@@ -1744,7 +1850,7 @@ async function resolveLegalityCache(mode, env) {
   const ls = mode.legalitySource;
   if (ls.type === "scryfall") {
     const result = await syncFormatFromScryfall(
-      mode.id, ls.query, true, !!ls.filterCommonPrints, env
+      mode.id, ls.query, true, !!ls.filterCommonPrints, env, !!ls.useFormatRarity
     );
     // syncFormatFromScryfall wrote to /formats/{id} as a side effect — read it back.
     const [idsSnap, namesSnap] = await Promise.all([
@@ -1754,6 +1860,9 @@ async function resolveLegalityCache(mode, env) {
     return {
       legalArenaIds: idsSnap.val() || {},
       legalNames: namesSnap.val() || {},
+      // Only present when the mode opted into format-rarity. Null otherwise
+      // so we don't bloat every scryfall cache with a redundant map.
+      rarityByName: ls.useFormatRarity ? (result.rarityByName || {}) : null,
       totalCards: result.totalCards || 0,
     };
   }
