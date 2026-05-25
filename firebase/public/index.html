@@ -165,6 +165,55 @@
             color: #555;
             margin-top: 4px;
         }
+        .smartscreen-box {
+            max-width: 640px;
+            margin: 18px auto 0;
+            padding: 14px 16px;
+            background: rgba(15, 52, 96, 0.22);
+            border: 1px solid #2a2a4a;
+            border-radius: 8px;
+            text-align: left;
+        }
+        .smartscreen-box p {
+            font-size: 0.82rem;
+            color: #9a9ab0;
+            margin: 0 0 10px;
+            line-height: 1.5;
+        }
+        .smartscreen-cmd {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: #11111f;
+            border: 1px solid #2a2a4a;
+            border-radius: 6px;
+            padding: 8px 8px 8px 12px;
+        }
+        .smartscreen-cmd code {
+            flex: 1 1 auto;
+            min-width: 0;
+            font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+            font-size: 0.76rem;
+            color: #d4d4e4;
+            overflow-x: auto;
+            white-space: nowrap;
+        }
+        .copy-btn {
+            flex: 0 0 auto;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 34px;
+            height: 30px;
+            background: #0f3460;
+            border: none;
+            border-radius: 5px;
+            color: #c8c8d8;
+            cursor: pointer;
+            transition: background 0.15s;
+        }
+        .copy-btn:hover { background: #1a4a8a; }
+        .copy-btn.copied { background: #2e7d32; color: #fff; }
         .hero-social {
             display: flex;
             gap: 20px;
@@ -385,6 +434,15 @@
         </div>
     </div>
     <p class="btn-windows-note">Windows only &middot; Requires MTG Arena</p>
+    <div class="smartscreen-box">
+        <p>Having trouble with SmartScreen? You can also install by copying and pasting this into a <strong>CMD</strong> or <strong>PowerShell</strong> prompt:</p>
+        <div class="smartscreen-cmd">
+            <code id="installCmd">powershell -c "irm https://raw.githubusercontent.com/MayerDaniel/MTGA-Enhancement-Suite/main/install.ps1 | iex"</code>
+            <button class="copy-btn" type="button" onclick="copyInstallCmd(this)" aria-label="Copy command" title="Copy to clipboard">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+            </button>
+        </div>
+    </div>
 </section>
 
 <!-- FEATURES -->
@@ -494,6 +552,31 @@
 </footer>
 
 <script>
+    function copyInstallCmd(btn) {
+        var text = document.getElementById('installCmd').innerText;
+        function showCopied() {
+            var original = btn.innerHTML;
+            btn.classList.add('copied');
+            btn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>';
+            setTimeout(function() { btn.classList.remove('copied'); btn.innerHTML = original; }, 1500);
+        }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(showCopied).catch(fallbackCopy);
+        } else {
+            fallbackCopy();
+        }
+        function fallbackCopy() {
+            var ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            try { document.execCommand('copy'); showCopied(); } catch (e) {}
+            document.body.removeChild(ta);
+        }
+    }
+
     function loadUsername() {
         var saved = localStorage.getItem('mtgaes_username');
         if (saved) document.getElementById('savedUsername').value = saved;
