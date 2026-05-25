@@ -35,25 +35,46 @@
     <Property Id="ARPHELPLINK" Value="https://github.com/MayerDaniel/MTGA-Enhancement-Suite" />
 
     <!--
-      Auto-detect the MTGA game folder from the registry value MTGA's own
-      installer writes: HKLM\SOFTWARE\Wizards of the Coast\MTGArena\Path. It's a
-      stable key (not keyed by a version-specific product GUID) and present in
-      both the 64-bit and WOW6432Node views, so it resolves regardless of MSI
-      bitness. This covers every *standalone* install — default location AND
-      custom drives (e.g. D:\Games\MTGA). Steam / Epic installs don't write this
-      key, so for those (and if MTGA isn't installed) INSTALLFOLDER falls back
-      to the default Program Files path below and the user picks their folder
-      with the Browse button.
+      Auto-detect the MTGA game folder from the registry, covering both install
+      sources (Steam preferred when both are present):
+
+        1. Steam: HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\
+           "Steam App 2141910"\InstallLocation. Steam writes the real game dir
+           here even when the library is on another drive. (2141910 is MTGA's
+           Steam app id.) This key is in the 64-bit view only.
+        2. Standalone: HKLM\SOFTWARE\Wizards of the Coast\MTGArena\Path — the
+           stable, non-GUID key MTGA's own installer writes (any drive).
+
+      Both reads force the 64-bit registry view (Bitness=always64) so they work
+      regardless of the MSI's own bitness. If neither key exists (Epic, or MTGA
+      not installed), INSTALLFOLDER falls back to the default Program Files path
+      and the user picks their folder with Browse.
     -->
-    <Property Id="INSTALLFOLDER">
-      <RegistrySearch Id="MtgaInstallPath"
-                      Root="HKLM"
+    <Property Id="MTGADIR_STEAM">
+      <RegistrySearch Id="MtgaSteam" Bitness="always64" Root="HKLM"
+                      Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Steam App 2141910"
+                      Name="InstallLocation" Type="directory" />
+    </Property>
+    <Property Id="MTGADIR_STANDALONE">
+      <RegistrySearch Id="MtgaStandalone" Bitness="always64" Root="HKLM"
                       Key="SOFTWARE\Wizards of the Coast\MTGArena"
-                      Name="Path"
-                      Type="directory" />
+                      Name="Path" Type="directory" />
     </Property>
 
-    <!-- Fallback default when the registry search finds nothing. -->
+    <!--
+      Pick the detected path into INSTALLFOLDER (Steam first). These are Type 51
+      set-property actions — pure MSI property assignment, no code/script, so
+      they don't reintroduce the AV concern. The Steam value has no trailing
+      backslash (MSI directory properties need one), so we append it; the
+      standalone Path value already ends in one. Conditions are mutually
+      exclusive, so only one ever runs.
+    -->
+    <SetProperty Action="SetMtgaDirSteam" Id="INSTALLFOLDER" Value="[MTGADIR_STEAM]\"
+                 After="AppSearch" Sequence="both" Condition="MTGADIR_STEAM" />
+    <SetProperty Action="SetMtgaDirStandalone" Id="INSTALLFOLDER" Value="[MTGADIR_STANDALONE]"
+                 After="AppSearch" Sequence="both" Condition="MTGADIR_STANDALONE AND NOT MTGADIR_STEAM" />
+
+    <!-- Fallback default when neither key is found. -->
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="WotcDir" Name="Wizards of the Coast">
         <Directory Id="INSTALLFOLDER" Name="MTGA" />
