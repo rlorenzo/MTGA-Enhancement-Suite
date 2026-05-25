@@ -182,7 +182,7 @@
         }
         .smartscreen-cmd {
             display: flex;
-            align-items: center;
+            align-items: flex-start;
             gap: 8px;
             background: #11111f;
             border: 1px solid #2a2a4a;
@@ -194,9 +194,11 @@
             min-width: 0;
             font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
             font-size: 0.76rem;
+            line-height: 1.5;
             color: #d4d4e4;
-            overflow-x: auto;
-            white-space: nowrap;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            word-break: break-word;
         }
         .copy-btn {
             flex: 0 0 auto;
