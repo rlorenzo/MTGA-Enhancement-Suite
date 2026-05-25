@@ -35,10 +35,25 @@
     <Property Id="ARPHELPLINK" Value="https://github.com/MayerDaniel/MTGA-Enhancement-Suite" />
 
     <!--
-      INSTALLFOLDER is the MTGA game folder (the one containing MTGA.exe).
-      Defaults to the standalone install location; Steam / Epic users change it
-      via the Browse button in the install-directory dialog.
+      Auto-detect the MTGA game folder from the registry value MTGA's own
+      installer writes: HKLM\SOFTWARE\Wizards of the Coast\MTGArena\Path. It's a
+      stable key (not keyed by a version-specific product GUID) and present in
+      both the 64-bit and WOW6432Node views, so it resolves regardless of MSI
+      bitness. This covers every *standalone* install — default location AND
+      custom drives (e.g. D:\Games\MTGA). Steam / Epic installs don't write this
+      key, so for those (and if MTGA isn't installed) INSTALLFOLDER falls back
+      to the default Program Files path below and the user picks their folder
+      with the Browse button.
     -->
+    <Property Id="INSTALLFOLDER">
+      <RegistrySearch Id="MtgaInstallPath"
+                      Root="HKLM"
+                      Key="SOFTWARE\Wizards of the Coast\MTGArena"
+                      Name="Path"
+                      Type="directory" />
+    </Property>
+
+    <!-- Fallback default when the registry search finds nothing. -->
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="WotcDir" Name="Wizards of the Coast">
         <Directory Id="INSTALLFOLDER" Name="MTGA" />
