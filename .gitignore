@@ -55,3 +55,8 @@ context/
 release/
 firebase/.firebase/
 CLAUDE.md
+
+# MSI build artifacts
+MsiInstaller/stage/
+MsiInstaller/*.wixpdb
+MsiInstaller/obj/

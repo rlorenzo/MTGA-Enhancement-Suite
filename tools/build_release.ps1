@@ -66,6 +66,19 @@ if (Test-Path $iconsSrc) {
 }
 Write-Host ""
 
+Write-Host "=== Building MSI installer ==="
+# The MSI bundles BepInEx + the plugin and installs declaratively, so Windows
+# Defender doesn't flag it like the self-contained EXE. Non-fatal: if WiX isn't
+# installed we just skip it (the EXE + PS1 routes still ship).
+try {
+    & "$PSScriptRoot\build_msi.ps1" $Version
+    if ($LASTEXITCODE -ne 0) { Write-Host "  MSI build returned $LASTEXITCODE — skipping" -ForegroundColor Yellow }
+} catch {
+    Write-Host "  MSI build skipped: $($_.Exception.Message)" -ForegroundColor Yellow
+    Write-Host "  (Install WiX v5: dotnet tool install --global wix --version 5.0.2; wix extension add -g WixToolset.UI.wixext/5.0.2)" -ForegroundColor Yellow
+}
+Write-Host ""
+
 Write-Host "=== Signing manifest ==="
 # manifest covers DLLs + config only — the auto-updater swaps DLLs at runtime,
 # so the installer EXE is intentionally NOT in the manifest. It's just a GitHub

@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  MTGA+ (MTGA Enhancement Suite) MSI installer.
+
+  Unlike the .NET EXE installer (which shells out to `irm install.ps1 | iex`
+  and trips Defender's "download + execute remote script" heuristics), this
+  MSI BUNDLES everything and lays it down declaratively:
+
+    - BepInEx 5 (the winhttp.dll doorstop + BepInEx/core) into the MTGA folder
+    - The MTGA+ plugin (DLLs + config + icons) into BepInEx/plugins
+    - The mtgaes:// URL-scheme registry entries (HKCR, per-machine)
+
+  No network access, no script execution at install time -> a plain file +
+  registry MSI that AV engines don't flag. The plugin's built-in auto-updater
+  pulls newer releases after install, so the bundled DLLs only need to be a
+  recent build.
+
+  Payload is staged by tools/build_msi.ps1 and harvested via the Files element.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <Package Name="MTGA+ (Enhancement Suite)"
+           Manufacturer="MTGA+"
+           Version="$(Version)"
+           UpgradeCode="7e3f2a10-9c4b-4d7e-a1f2-0c1d2e3f4a5b"
+           Scope="perMachine"
+           Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of MTGA+ is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Add/Remove Programs metadata -->
+    <Property Id="ARPURLINFOABOUT" Value="https://mtga-enhancement-suite.web.app" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/MayerDaniel/MTGA-Enhancement-Suite" />
+
+    <!--
+      INSTALLFOLDER is the MTGA game folder (the one containing MTGA.exe).
+      Defaults to the standalone install location; Steam / Epic users change it
+      via the Browse button in the install-directory dialog.
+    -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="WotcDir" Name="Wizards of the Coast">
+        <Directory Id="INSTALLFOLDER" Name="MTGA" />
+      </Directory>
+    </StandardDirectory>
+
+    <!-- All bundled files (BepInEx + plugin), harvested from the stage tree. -->
+    <ComponentGroup Id="PayloadFiles" Directory="INSTALLFOLDER">
+      <Files Include="$(StageDir)\**" />
+    </ComponentGroup>
+
+    <!-- mtgaes:// URL scheme. HKCR under a per-machine package resolves to
+         HKLM\Software\Classes, so it's registered for every user. The command
+         points at MTGA.exe in the chosen folder. -->
+    <Component Id="UrlScheme" Directory="INSTALLFOLDER" Guid="b2c3d4e5-6f70-4811-9a2b-3c4d5e6f7081">
+      <RegistryKey Root="HKCR" Key="mtgaes">
+        <RegistryValue Type="string" Value="URL:MTGA Enhancement Suite" />
+        <RegistryValue Type="string" Name="URL Protocol" Value="" />
+        <RegistryKey Key="shell\open\command">
+          <RegistryValue Type="string" Value="&quot;[INSTALLFOLDER]MTGA.exe&quot; &quot;%1&quot;" />
+        </RegistryKey>
+      </RegistryKey>
+    </Component>
+
+    <Feature Id="Main" Title="MTGA+">
+      <ComponentGroupRef Id="PayloadFiles" />
+      <ComponentRef Id="UrlScheme" />
+    </Feature>
+
+    <!-- Install-directory wizard (Welcome -> License -> Choose folder ->
+         Install -> Finish), so Steam/Epic users can point at their MTGA dir. -->
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(LicenseRtf)" />
+
+  </Package>
+</Wix>
