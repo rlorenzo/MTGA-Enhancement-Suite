@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 using HarmonyLib;
 using MTGAEnhancementSuite.Features;
@@ -40,6 +41,10 @@ namespace MTGAEnhancementSuite.Patches
         // any time the deck manager is open in normal mode).
         private const string MoveSingleBtnName = "MTGAES_MoveSingleButton";
         private const string NewFolderBtnName  = "MTGAES_NewFolderButton";
+        // Local-deck conversion: "Make Local" shows for a focused cloud deck,
+        // "Make Cloud" shows for a focused local deck.
+        private const string MakeLocalBtnName  = "MTGAES_MakeLocalButton";
+        private const string MakeCloudBtnName  = "MTGAES_MakeCloudButton";
 
         // Reflection caches
         private static FieldInfo _favoriteBtnField;
@@ -66,6 +71,8 @@ namespace MTGAEnhancementSuite.Patches
         private static GameObject _moveBtnGO;
         private static GameObject _moveSingleBtnGO;
         private static GameObject _newFolderBtnGO;
+        private static GameObject _makeLocalBtnGO;
+        private static GameObject _makeCloudBtnGO;
 
         [HarmonyPostfix]
         private static void Postfix(DeckManagerController __instance)
@@ -149,6 +156,38 @@ namespace MTGAEnhancementSuite.Patches
                 }
                 ButtonTooltip.Attach(_newFolderBtnGO, "Create a new folder");
 
+                // "Make Local": export the focused cloud deck to a local text
+                // file and free its cloud slot. Visible only when a cloud deck
+                // is focused (driven by OnSelectionFocusChanged).
+                if (parent.Find(MakeLocalBtnName) == null)
+                {
+                    _makeLocalBtnGO = BuildButton(sourceGO, parent, MakeLocalBtnName,
+                        sourceGO.transform.GetSiblingIndex() + 7,
+                        PaintMakeLocalIcon, OnMakeLocalClicked);
+                    _makeLocalBtnGO.SetActive(false);
+                }
+                else
+                {
+                    _makeLocalBtnGO = parent.Find(MakeLocalBtnName).gameObject;
+                }
+                ButtonTooltip.Attach(_makeLocalBtnGO, "Move to Local Decks (frees a cloud slot)");
+
+                // "Make Cloud": import the focused local deck as a real cloud
+                // deck (needs a free slot). Visible only when a local deck is
+                // focused.
+                if (parent.Find(MakeCloudBtnName) == null)
+                {
+                    _makeCloudBtnGO = BuildButton(sourceGO, parent, MakeCloudBtnName,
+                        sourceGO.transform.GetSiblingIndex() + 8,
+                        PaintMakeCloudIcon, OnMakeCloudClicked);
+                    _makeCloudBtnGO.SetActive(false);
+                }
+                else
+                {
+                    _makeCloudBtnGO = parent.Find(MakeCloudBtnName).gameObject;
+                }
+                ButtonTooltip.Attach(_makeCloudBtnGO, "Make this a cloud deck");
+
                 // Collect MTGA's native per-deck buttons so we can hide/show
                 // them when multi-select toggles. Skip deckOrder/deckBucket
                 // (sort + format filter) — those stay visible always.
@@ -225,13 +264,16 @@ namespace MTGAEnhancementSuite.Patches
             // select (where Move-to-folder covers the same ground).
             if (_newFolderBtnGO != null) _newFolderBtnGO.SetActive(!multi);
 
-            // Single-deck Move button: only in normal mode AND only when a
-            // deck is currently focused. The UpdateSelectedDeckView postfix
-            // keeps this in sync as the user clicks around; this call here
-            // covers the mode-toggle case (e.g. exiting multi-select while
-            // a deck is focused).
-            if (_moveSingleBtnGO != null)
-                _moveSingleBtnGO.SetActive(!multi && IsDeckCurrentlyFocused());
+            // Focus-dependent buttons. The UpdateSelectedDeckView postfix keeps
+            // these in sync as the user clicks around; this call here covers the
+            // mode-toggle case (e.g. exiting multi-select while a deck is
+            // focused). Cloud focus drives Move + Make Local; local focus drives
+            // Make Cloud.
+            bool cloudFocus = !multi && IsDeckCurrentlyFocused();
+            bool localFocus = !multi && Features.LocalDeckController.HasLocalSelection;
+            if (_moveSingleBtnGO != null) _moveSingleBtnGO.SetActive(cloudFocus);
+            if (_makeLocalBtnGO  != null) _makeLocalBtnGO.SetActive(cloudFocus);
+            if (_makeCloudBtnGO  != null) _makeCloudBtnGO.SetActive(localFocus);
 
             // Refresh Delete-N label whenever the selection set changes.
             if (multi && _deleteBtnGO != null) UpdateDeleteCountLabel();
@@ -250,16 +292,27 @@ namespace MTGAEnhancementSuite.Patches
 
         /// <summary>
         /// Called by the Harmony postfix on
-        /// <c>DeckManagerController.UpdateSelectedDeckView</c> — the same
-        /// hook MTGA uses to flip <c>Interactable</c> on its own per-deck
-        /// buttons. <paramref name="hasFocus"/> reflects whether the user
-        /// has a deck selected; we hide the single-deck Move button when
-        /// no deck is focused so it never appears to do nothing.
+        /// <c>DeckManagerController.UpdateSelectedDeckView</c> — the same hook
+        /// MTGA uses to flip <c>Interactable</c> on its own per-deck buttons.
+        /// Branches on whether the focused deck is one of our local decks:
+        ///   - cloud deck focused → show Move-to-folder + Make Local
+        ///   - local deck focused → show Make Cloud
+        ///   - nothing focused    → hide all three
+        /// Also forwards the selection to <see cref="Features.LocalDeckController"/>
+        /// so the local-selection state stays current.
         /// </summary>
-        internal static void OnSelectionFocusChanged(bool hasFocus)
+        internal static void OnSelectionFocusChanged(Wizards.Mtga.Decks.DeckViewInfo info)
         {
+            Features.LocalDeckController.OnSelectionChanged(info);
+
             if (DeckMultiSelectState.IsActive) return;
-            if (_moveSingleBtnGO != null) _moveSingleBtnGO.SetActive(hasFocus);
+
+            bool isLocal = info != null && Features.LocalDeckStore.IsLocal(info.deckId);
+            bool cloudFocus = info != null && !isLocal;
+
+            if (_moveSingleBtnGO != null) _moveSingleBtnGO.SetActive(cloudFocus);
+            if (_makeLocalBtnGO  != null) _makeLocalBtnGO.SetActive(cloudFocus);
+            if (_makeCloudBtnGO  != null) _makeCloudBtnGO.SetActive(isLocal);
         }
 
         private static void UpdateDeleteCountLabel()
@@ -296,6 +349,13 @@ namespace MTGAEnhancementSuite.Patches
             int n = DeckMultiSelectState.SelectionCount;
             if (n <= 0) return;
             var ids = new List<Guid>(DeckMultiSelectState.SelectedIds);
+            // Folders are a cloud-deck concept; local decks already live in the
+            // Local Decks folder. Reject a move if any local deck is selected.
+            if (ids.Any(id => Features.LocalDeckStore.IsLocal(id)))
+            {
+                Toast.Warning("Local decks can't be moved into folders");
+                return;
+            }
             MoveToFolderModal.Show(ids);
         }
 
@@ -340,6 +400,60 @@ namespace MTGAEnhancementSuite.Patches
             MoveToFolderModal.ShowCreateFolderModal();
         }
 
+        // Make Local: act on the focused CLOUD deck.
+        private static void OnMakeLocalClicked()
+        {
+            if (_controller == null || _selectedDeckField == null) return;
+            var deck = _selectedDeckField.GetValue(_controller);
+            if (deck == null) { Toast.Info("Select a deck first"); return; }
+            Guid id = ReadDeckId(deck);
+            if (id == Guid.Empty) return;
+            string name = ReadDeckName(deck);
+            ConfirmActionModal.Show(
+                $"Move \"{name}\" to Local Decks?",
+                "It will be exported to a text file and removed from your cloud decks, freeing a slot. You can convert it back any time.",
+                "Move to Local",
+                () => Features.LocalDeckConverter.MakeLocal(id, name));
+        }
+
+        // Make Cloud: act on the focused LOCAL deck.
+        private static void OnMakeCloudClicked()
+        {
+            var localId = Features.LocalDeckController.SelectedLocalDeckId;
+            if (!localId.HasValue) { Toast.Info("Select a local deck first"); return; }
+            Features.LocalDeckConverter.MakeCloud(localId.Value);
+        }
+
+        private static Guid ReadDeckId(object deck)
+        {
+            var type = deck.GetType();
+            try
+            {
+                var idField = AccessTools.Field(type, "Id");
+                if (idField != null) return (Guid)idField.GetValue(deck);
+                var idProp = AccessTools.Property(type, "Id");
+                if (idProp != null) return (Guid)idProp.GetValue(deck);
+            }
+            catch (Exception ex) { Plugin.Log.LogWarning($"ReadDeckId: {ex.Message}"); }
+            return Guid.Empty;
+        }
+
+        private static string ReadDeckName(object deck)
+        {
+            try
+            {
+                var summaryProp = AccessTools.Property(deck.GetType(), "Summary");
+                var summary = summaryProp?.GetValue(deck);
+                if (summary != null)
+                {
+                    var nameField = AccessTools.Field(summary.GetType(), "Name");
+                    if (nameField != null) return nameField.GetValue(summary) as string ?? "this deck";
+                }
+            }
+            catch { }
+            return "this deck";
+        }
+
         // -----------------------------------------------------------------
         // Mutations (called from the modals)
         // -----------------------------------------------------------------
@@ -355,12 +469,22 @@ namespace MTGAEnhancementSuite.Patches
 
         private static System.Collections.IEnumerator BulkDeleteCoroutine(IReadOnlyList<Guid> deckIds)
         {
+            // Partition: local decks are files on disk; cloud decks go through
+            // the server DeleteDeck path.
+            var localIds = deckIds.Where(id => Features.LocalDeckStore.IsLocal(id)).ToList();
+            var cloudIds = deckIds.Where(id => !Features.LocalDeckStore.IsLocal(id)).ToList();
+
+            // Delete local decks immediately (synchronous file ops).
+            foreach (var id in localIds) Features.LocalDeckStore.Delete(id);
+            if (localIds.Count > 0) DeckViewSelectorPatch.RebuildLocalDecks();
+
             var pantryType = AccessTools.TypeByName("Pantry");
             var get = pantryType.GetMethod("Get").MakeGenericMethod(typeof(DecksManager));
             var dm = get.Invoke(null, null);
             if (dm == null)
             {
                 Plugin.Log.LogWarning("Bulk delete: DecksManager not in Pantry");
+                if (localIds.Count > 0) DeckMultiSelectState.ExitMode();
                 yield break;
             }
             var deleteMethod = AccessTools.Method(typeof(DecksManager), "DeleteDeck",
@@ -368,26 +492,27 @@ namespace MTGAEnhancementSuite.Patches
             if (deleteMethod == null)
             {
                 Plugin.Log.LogWarning("Bulk delete: DecksManager.DeleteDeck(Guid) not found");
+                if (localIds.Count > 0) DeckMultiSelectState.ExitMode();
                 yield break;
             }
 
-            // Fire all the deletes; collect the returned Promise objects so
+            // Fire all the cloud deletes; collect the returned Promise objects so
             // we can poll IsDone on each before refreshing. Each promise is
             // typed Promise<bool> in an unreferenced assembly, so we keep
             // them as `object` and reflect on IsDone per type.
             var promises = new List<object>();
-            foreach (var id in deckIds)
+            foreach (var id in cloudIds)
             {
                 object promise = null;
                 try { promise = deleteMethod.Invoke(dm, new object[] { id }); }
                 catch (Exception ex) { Plugin.Log.LogWarning($"DeleteDeck({id}) threw: {ex.Message}"); }
                 if (promise != null) promises.Add(promise);
             }
-            Plugin.Log.LogInfo($"Bulk delete: dispatched {promises.Count}/{deckIds.Count} promises");
+            Plugin.Log.LogInfo($"Bulk delete: {localIds.Count} local, dispatched {promises.Count}/{cloudIds.Count} cloud promises");
 
-            // Drop from the org map immediately; reconcile will tidy up
+            // Drop cloud ids from the org map immediately; reconcile will tidy up
             // later, but this avoids transient stale state.
-            foreach (var id in deckIds) DeckOrganizationManager.ForgetDeck(id);
+            foreach (var id in cloudIds) DeckOrganizationManager.ForgetDeck(id);
 
             // Wait for all promises. Cap total wait at 30s so a stuck
             // promise doesn't lock the UI forever.
@@ -421,7 +546,7 @@ namespace MTGAEnhancementSuite.Patches
         /// function because it's a coroutine — we need StartCoroutine on
         /// the returned IEnumerator.
         /// </summary>
-        private static void ReloadDecksLikeMTGADoes()
+        internal static void ReloadDecksLikeMTGADoes()
         {
             try
             {
@@ -668,6 +793,23 @@ namespace MTGAEnhancementSuite.Patches
                 pivot: new Vector2(0f, 0f), pos: new Vector2(-13f, 7f));
         }
 
+        // Make Local (cloud -> local file): folder icon + a down arrow,
+        // "pull down to your local folder".
+        private static void PaintMakeLocalIcon(GameObject clone)
+        {
+            var host = MakeIconHost(clone, "MTGAES_MakeLocal");
+            if (TryPaintSprite(host.transform, "makelocal", IconGrey)) return;
+            PaintGlyph(host.transform, "↓", IconGrey, fontSize: 46);
+        }
+
+        // Make Cloud (local -> cloud): an up arrow, "push up to the cloud".
+        private static void PaintMakeCloudIcon(GameObject clone)
+        {
+            var host = MakeIconHost(clone, "MTGAES_MakeCloud");
+            if (TryPaintSprite(host.transform, "makecloud", IconGrey)) return;
+            PaintGlyph(host.transform, "↑", IconGrey, fontSize: 46);
+        }
+
         // Reuses the folder sprite (or vector folder) and overlays a small
         // "+" in the bottom-right corner so the New-Folder button is
         // visually distinct from the Move-to-Folder button at a glance.
@@ -806,8 +948,45 @@ namespace MTGAEnhancementSuite.Patches
         [HarmonyPostfix]
         private static void Postfix(Wizards.Mtga.Decks.DeckViewInfo deckViewInfo)
         {
-            try { DeckManagerControllerPatch.OnSelectionFocusChanged(deckViewInfo != null); }
+            try { DeckManagerControllerPatch.OnSelectionFocusChanged(deckViewInfo); }
             catch (Exception ex) { Plugin.Log.LogWarning($"OnSelectionFocusChanged: {ex.Message}"); }
+        }
+    }
+
+    /// <summary>
+    /// Makes MTGA's native Delete button work for local decks. When a local
+    /// deck is focused, <c>_selectedDeck</c> is null (the synthetic id isn't in
+    /// MTGA's list), so the stock <c>Delete_OnClick</c> no-ops. We intercept,
+    /// confirm, and delete the local file instead — so the same trash button
+    /// the user already knows works for both cloud and local decks.
+    /// </summary>
+    [HarmonyPatch(typeof(DeckManagerController), "Delete_OnClick")]
+    internal static class DeckManagerDeletePatch
+    {
+        [HarmonyPrefix]
+        private static bool Prefix()
+        {
+            try
+            {
+                var localId = Features.LocalDeckController.SelectedLocalDeckId;
+                if (!localId.HasValue) return true; // cloud deck (or nothing) → native delete
+
+                var local = Features.LocalDeckStore.Get(localId.Value);
+                var name = local?.Name ?? "this deck";
+                ConfirmDeleteModal.Show(1, () =>
+                {
+                    Features.LocalDeckStore.Delete(localId.Value);
+                    Features.LocalDeckController.ClearSelection();
+                    DeckViewSelectorPatch.RebuildLocalDecks();
+                    Toast.Success($"Deleted local deck '{name}'");
+                });
+                return false; // skip the native (no-op) handler
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"DeckManagerDeletePatch.Prefix: {ex.Message}");
+                return true;
+            }
         }
     }
 }

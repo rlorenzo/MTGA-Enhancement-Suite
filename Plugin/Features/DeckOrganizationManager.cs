@@ -168,6 +168,10 @@ namespace MTGAEnhancementSuite.Features
         {
             if (liveDeckIds == null) return 0;
             var live = new HashSet<Guid>(liveDeckIds);
+            // Defense in depth: never prune against an empty live set. Callers
+            // are expected to guard this too (see DeckListReconcilePatch), but a
+            // stray empty call here would wipe every folder assignment + save.
+            if (live.Count == 0) return 0;
             int removed = 0;
             foreach (var folder in Org.Folders)
             {

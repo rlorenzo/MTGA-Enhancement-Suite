@@ -30,6 +30,11 @@
       <HintPath>C:\Program Files\Wizards of the Coast\MTGA\MTGA_Data\Managed\UnityEngine.UnityWebRequestModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <!-- UnityEngine.Input (KeyCode, GetKeyDown) lives here in modern Unity. -->
+    <Reference Include="UnityEngine.InputLegacyModule">
+      <HintPath>C:\Program Files\Wizards of the Coast\MTGA\MTGA_Data\Managed\UnityEngine.InputLegacyModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="Newtonsoft.Json">
       <HintPath>C:\Program Files\Wizards of the Coast\MTGA\MTGA_Data\Managed\Newtonsoft.Json.dll</HintPath>
       <Private>false</Private>

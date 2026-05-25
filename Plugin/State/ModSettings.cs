@@ -74,6 +74,14 @@ namespace MTGAEnhancementSuite.State
                     var folderCount = settings.DeckOrganization.Folders?.Count ?? 0;
                     var rootOrderCount = settings.DeckOrganization.RootOrder?.Count ?? 0;
                     Plugin.Log.LogInfo($"Settings loaded: companions={!settings.DisableCompanions}, cardVFX={!settings.DisableCardVFX}, folders={folderCount}, rootOrder={rootOrderCount}");
+
+                    // Keep a once-per-launch backup of the file as loaded, BEFORE
+                    // any runtime mutation. If something ever clobbers the folder
+                    // data mid-session, the user (or we) can restore the launch
+                    // state from settings.json.startup.bak.
+                    try { File.Copy(path, path + ".startup.bak", true); }
+                    catch (Exception bex) { Plugin.Log.LogWarning($"Settings backup failed: {bex.Message}"); }
+
                     if (needsRewrite) { _instance = settings; settings.Save(); }
                     return settings;
                 }

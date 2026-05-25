@@ -25,5 +25,14 @@ namespace MTGAEnhancementSuite
 
         // Challenge UI
         public const string FormatSpinnerName = "MTGAES_FormatSpinner";
+
+        // ---- Local decks: deck-builder save-intercept (most patch-fragile) ----
+        // WrapperDeckBuilder is MTGA's deck-builder scene controller. These
+        // private members are reflected by DeckBuilderSavePatch / LocalDeckEditor.
+        // If a future MTGA patch renames any of them, fix here.
+        public const string WrapperDeckBuilder_SaveCoroutine = "Coroutine_SaveDeck";
+        public const string WrapperDeckBuilder_IsSavingField = "_isSavingDeck";
+        public const string WrapperDeckBuilder_SaveSuccessField = "_isDeckSaveSuccess";
+        public const string DeckManager_EditGoToBuilder = "Edit_GoToDeckBuilder";
     }
 }

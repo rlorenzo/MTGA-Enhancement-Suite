@@ -105,6 +105,12 @@ namespace MTGAEnhancementSuite
         private void Awake()
         {
             Plugin.Log.LogInfo("PluginBehaviour.Awake - starting coroutines");
+
+            // Load local decks from disk so they're ready when the deck
+            // manager first opens. Cheap file scan; safe if the folder is empty.
+            try { Features.LocalDeckStore.Load(); }
+            catch (Exception ex) { Plugin.Log.LogWarning($"LocalDeckStore.Load on startup: {ex.Message}"); }
+
             SceneManager.sceneLoaded += OnSceneLoaded;
             StartCoroutine(PollForNavBar());
             StartCoroutine(Patches.AuthPatch.WaitForLoginAndAuth());
@@ -120,6 +126,30 @@ namespace MTGAEnhancementSuite
 
             // Hook challenge lifecycle events after Pantry is ready
             StartCoroutine(HookChallengeLifecycleEvents());
+        }
+
+        // F7 = toggle 100x fast-forward on the duel's animation queue.
+        // Bound on the persistent behaviour so it works in every scene;
+        // safe to mash outside a duel because Toggle() no-ops when
+        // GameManager is missing. GetKeyDown is edge-trigger so holding
+        // doesn't re-fire every frame.
+        //
+        // Tick() runs every frame to watch the queue and auto-stop the
+        // fast-forward as soon as the backlog is drained — that's the
+        // "we've caught up" signal. It also handles the failsafe case
+        // where the duel scene tears down mid-fast-forward.
+        private void Update()
+        {
+            try
+            {
+                if (Input.GetKeyDown(KeyCode.F7))
+                    Features.AnimationFastForward.Toggle();
+                Features.AnimationFastForward.Tick();
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"Hotkey handler error: {ex}");
+            }
         }
 
         private void OnUrlReceivedFromPipe(string url)
@@ -412,6 +442,10 @@ namespace MTGAEnhancementSuite
             Plugin.Log.LogInfo("PluginBehaviour.OnDestroy called (should NOT happen)");
             SceneManager.sceneLoaded -= OnSceneLoaded;
             TcpIpcServer.Stop();
+            // Last-ditch failsafe: if the plugin is torn down mid-fast-
+            // forward, restore Time.timeScale so the game (or whatever
+            // host process is left) doesn't continue at 100x.
+            Features.AnimationFastForward.ForceRestore();
         }
     }
 
@@ -457,6 +491,6 @@ namespace MTGAEnhancementSuite
     {
         public const string GUID = "com.mtgaenhancement.suite";
         public const string NAME = "MTGA Enhancement Suite";
-        public const string VERSION = "0.17.1";
+        public const string VERSION = "0.18.0";
     }
 }

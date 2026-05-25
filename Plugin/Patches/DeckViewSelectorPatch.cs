@@ -55,6 +55,19 @@ namespace MTGAEnhancementSuite.Patches
         private static DeckViewSelector _instance;
         private static readonly List<DeckFolderView> _injectedViews = new List<DeckFolderView>();
 
+        // The single "Local Decks" folder pinned to the bottom. Separate from
+        // the user-folder system: its tiles are synthetic decks backed by local
+        // text files, not server decks routed via NetDeckFolderId.
+        private const string LocalFolderName = "Local Decks";
+        private static DeckFolderView _localFolderView;
+        // Stable GUID for the local folder (distinct from any user folder id).
+        private static readonly Guid LocalFolderId =
+            new Guid("10ca1dec-0000-0000-0000-000000000001");
+        // Cache of synthetic DeckViewInfos so we don't re-parse every local deck
+        // on every SetDecks pass (which fires on each bucket/format change).
+        // Invalidated by RebuildLocalDecks after any mutation.
+        private static List<DeckViewInfo> _localInfoCache;
+
         private static void EnsureReflectionCache()
         {
             if (_folderParentField != null) return;
@@ -167,11 +180,105 @@ namespace MTGAEnhancementSuite.Patches
 
                 if (injected > 0)
                     Plugin.Log.LogInfo($"DeckViewSelectorPatch: injected {injected} user folder view(s)");
+
+                // Pin the "Local Decks" folder to the very bottom.
+                InjectLocalDecksFolder(__instance, folderParent, deckFolders, prefab,
+                    onDeckNameEndEdit);
             }
             catch (Exception ex)
             {
                 Plugin.Log.LogWarning($"DeckViewSelectorPatch.Initialize_Postfix failed: {ex.Message}");
             }
+        }
+
+        // -----------------------------------------------------------------
+        // Local Decks folder (bottom): synthetic, text-file-backed decks
+        // -----------------------------------------------------------------
+        private static void InjectLocalDecksFolder(DeckViewSelector instance, Transform folderParent,
+            List<DeckFolderView> deckFolders, DeckFolderView prefab, Action<DeckViewInfo, string> _unused)
+        {
+            try
+            {
+                var view = UnityEngine.Object.Instantiate(prefab, folderParent);
+                // Tile click → MTGA's own SelectDeck (animation + cross-folder
+                // deselect; sets _selectedDeck=null for our synthetic ids so
+                // native buttons stay inert). Double-click → our editor.
+                // Name-edit → rename the local file.
+                view.Initialize(
+                    new Action<DeckViewInfo>(instance.SelectDeck),
+                    new Action<DeckViewInfo>(Features.LocalDeckController.OnDoubleClick),
+                    new Action<DeckViewInfo, string>(Features.LocalDeckController.OnNameEdit),
+                    _ => { });
+                view.FolderId = LocalFolderId;
+
+                var nameLoc = view.FolderNameLocKey;
+                if (nameLoc != null)
+                {
+                    nameLoc.SetText("", null, LocalFolderName);
+                    var tmp = nameLoc.GetComponentInChildren<TextMeshProUGUI>(true);
+                    if (tmp != null) tmp.text = LocalFolderName;
+                }
+
+                // Bottom of the list (after native + user folders).
+                view.transform.SetAsLastSibling();
+                deckFolders.Add(view);
+                _localFolderView = view;
+
+                PopulateLocalFolder();
+                Plugin.Log.LogInfo("DeckViewSelectorPatch: injected Local Decks folder");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"InjectLocalDecksFolder failed: {ex.Message}");
+                _localFolderView = null;
+            }
+        }
+
+        /// <summary>
+        /// Rebuilds the synthetic tiles inside the Local Decks folder from
+        /// <see cref="Features.LocalDeckStore"/>. Safe to call repeatedly.
+        /// </summary>
+        public static void PopulateLocalFolder()
+        {
+            if (_localFolderView == null) return;
+            try
+            {
+                if (_localInfoCache == null)
+                {
+                    _localInfoCache = new List<DeckViewInfo>();
+                    foreach (var local in Features.LocalDeckStore.All)
+                    {
+                        var info = Features.LocalDeckBridge.BuildDeckViewInfo(local);
+                        if (info != null) _localInfoCache.Add(info);
+                    }
+                }
+                // allowUnownedCards: true — local decks may reference cards the
+                // player doesn't own; we still want to show them.
+                _localFolderView.SetDecks(_localInfoCache, true);
+                if (!_localFolderView.gameObject.activeSelf)
+                    _localFolderView.gameObject.SetActive(true);
+
+                // Show the same "+ New Deck" button MTGA puts on My Decks,
+                // wired to create a brand-new local deck. (Idempotent — the
+                // view reuses the button instance after the first call.)
+                _localFolderView.ShowCreateDeckButton(
+                    new Action(Features.LocalDeckEditor.CreateNew));
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"PopulateLocalFolder failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Re-reads local decks from disk and refreshes the folder. Call after
+        /// any make-local / make-cloud / rename / edit mutation.
+        /// </summary>
+        public static void RebuildLocalDecks()
+        {
+            Features.LocalDeckStore.Load();
+            _localInfoCache = null; // force rebuild of synthetic tiles
+            PopulateLocalFolder();
         }
 
         // -----------------------------------------------------------------
@@ -232,6 +339,11 @@ namespace MTGAEnhancementSuite.Patches
                 if (!view.gameObject.activeSelf)
                     view.gameObject.SetActive(true);
             }
+
+            // MTGA's SetDecks also ran on our Local Decks folder with the cloud
+            // deck list (which never matches our synthetic ids), so it emptied
+            // and hid it. Repopulate from disk and force-show.
+            PopulateLocalFolder();
         }
 
         // Attaches the right-click context menu handler to the Toggle's
@@ -300,6 +412,15 @@ namespace MTGAEnhancementSuite.Patches
                     UnityEngine.Object.Destroy(view.gameObject);
                 }
                 _injectedViews.Clear();
+
+                // Tear down the old Local Decks folder too — Initialize_Postfix
+                // re-injects it, so leaving the old one would duplicate it.
+                if (_localFolderView != null)
+                {
+                    deckFolders.Remove(_localFolderView);
+                    UnityEngine.Object.Destroy(_localFolderView.gameObject);
+                    _localFolderView = null;
+                }
 
                 // Pretend we never ran the Initialize injection — re-run it.
                 Initialize_Postfix(_instance, simpleSelect: false);
