@@ -1,0 +1,31 @@
+diff --git a/Runtimes/Unity/BepInEx.Unity.IL2CPP/Hook/Dobby/DobbyDetour.cs b/Runtimes/Unity/BepInEx.Unity.IL2CPP/Hook/Dobby/DobbyDetour.cs
+index 022de28..1acd16f 100644
+--- a/Runtimes/Unity/BepInEx.Unity.IL2CPP/Hook/Dobby/DobbyDetour.cs
++++ b/Runtimes/Unity/BepInEx.Unity.IL2CPP/Hook/Dobby/DobbyDetour.cs
+@@ -1,12 +1,25 @@
+ using System;
++using System.Runtime.InteropServices;
+ 
+ namespace BepInEx.Unity.IL2CPP.Hook.Dobby;
+ 
+ internal class DobbyDetour : BaseNativeDetour<DobbyDetour>
+ {
++    // [MAC FIX] Under Rosetta 2, Dobby's x86_64 backend patches the target code but does NOT
++    // invalidate the instruction cache (real x86 has a coherent icache, so it's a no-op there).
++    // Rosetta keeps executing the cached translation of the already-translated target and never
++    // sees the patch, so the hook silently does nothing. sys_icache_invalidate forces Rosetta to
++    // re-translate the patched region.
++    [DllImport("libSystem.dylib", EntryPoint = "sys_icache_invalidate")]
++    private static extern void sys_icache_invalidate(nint start, nuint len);
++
+     public DobbyDetour(nint originalMethodPtr, Delegate detourMethod) : base(originalMethodPtr, detourMethod) { }
+ 
+-    protected override void ApplyImpl() => DobbyLib.Commit(OriginalMethodPtr);
++    protected override void ApplyImpl()
++    {
++        DobbyLib.Commit(OriginalMethodPtr);
++        sys_icache_invalidate(OriginalMethodPtr, 64);
++    }
+ 
+     protected override unsafe void PrepareImpl()
+     {

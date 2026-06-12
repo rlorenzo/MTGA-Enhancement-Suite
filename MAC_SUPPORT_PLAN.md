@@ -61,9 +61,31 @@ Inspected the Steam-distributed MTGA bundle at `/Users/rexl/Library/Application 
 
 **Exit criterion (go):** ✅ All checks pass. Proceed to Phase 1.
 
-### Phase 1 — Il2CppInterop spike (1–2 weeks of evening work) — ❌ **NO-GO** (2026-05-14)
+### Phase 1 — Il2CppInterop spike (1–2 weeks of evening work) — 🟡 **PARTIAL** — generation fixed, runtime hooking is the new wall (updated 2026-06-12)
 
 Goal: produce a `.dylib` that loads into MTGA on macOS, logs "hello world", and successfully calls one game method via Il2CppInterop. **No mod features yet.**
+
+> **2026-06-12 update — the 2026-05-14 NO-GO is partially reversed.** Full writeup:
+> [`mac-spike/PHASE1B4-FINDINGS.md`](mac-spike/PHASE1B4-FINDINGS.md). The `Pass16` xref-scanner
+> crash that ended the spike is **fixed** with a ~6-line patch to Il2CppInterop
+> ([`mac-spike/patches/01-…`](mac-spike/patches/01-il2cppinterop-xref-scanner-llvm-fix.patch)):
+> the disassembler now skips indirect branches instead of throwing. **Interop generation now
+> completes** (179 game proxy assemblies in `BepInEx/interop/`), and **MTGA boots fully on Apple
+> Silicon** (Rosetta x86_64) with BepInEx injected and the account logged in — further than this
+> spike ever got. Required fixes along the way: force `arch -x86_64` in `run_bepinex.sh` (CoreCLR is
+> x64-only), start Steam + add `steam_appid.txt` (DRM), and ignore the non-fatal arm64-only
+> `BacktraceMacUnity.bundle`.
+>
+> **The new, deeper blocker:** plugin `Load()` never fires because **Dobby inline hooks do not take
+> effect under Rosetta 2** — proven in isolation ([`mac-spike/rosetta-hook-tests/`](mac-spike/rosetta-hook-tests/)).
+> Rosetta runs cached translations of code pages and never sees the patched bytes; `sys_icache_invalidate`
+> and `vm_protect` toggles don't help. This blocks BepInEx's plugin-load trigger **and every HarmonyX
+> patch** — the mod's whole mechanism. You can't escape to native arm64 (where hooks would work)
+> because Il2CppInterop's generator *and* runtime scanners are x86/Iced-only. The true path to a
+> working mod is a **native arm64 BepInEx/Il2CppInterop stack** (mirrors MelonLoader's in-flight
+> `osx-arm64` work), reusing the interop assemblies generated once under Rosetta. Phase 1's exit
+> criterion ("a HarmonyX patch fires") is **not yet met**, but the failure is now precisely located
+> one layer below where the previous NO-GO stopped.
 
 #### Phase 1.A — Research ✅ complete (2026-05-14)
 

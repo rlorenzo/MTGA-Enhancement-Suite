@@ -1,0 +1,30 @@
+diff --git a/Il2CppInterop.Common/XrefScans/XrefScannerLowLevel.cs b/Il2CppInterop.Common/XrefScans/XrefScannerLowLevel.cs
+index a8d44d7..ae131ab 100644
+--- a/Il2CppInterop.Common/XrefScans/XrefScannerLowLevel.cs
++++ b/Il2CppInterop.Common/XrefScans/XrefScannerLowLevel.cs
+@@ -31,7 +31,13 @@ public static class XrefScannerLowLevel
+                 // We hope and pray that the compiler didn't use short jumps for any function calls
+                 if (!instruction.IsJmpShort)
+                 {
+-                    yield return (IntPtr)ExtractTargetAddress(in instruction);
++                    // LLVM-optimized IL2CPP builds (notably macOS GameAssembly.dylib) emit
++                    // indirect call/jmp through a register or memory operand where MSVC emits
++                    // a direct near-branch. Those have no statically-extractable target, so
++                    // skip them instead of throwing — same as CallAndIndirectTargetsImpl.
++                    var targetAddress = ExtractTargetAddress(in instruction);
++                    if (targetAddress != 0)
++                        yield return (IntPtr)targetAddress;
+                     if (firstFlowControl && instruction.FlowControl == FlowControl.UnconditionalBranch) yield break;
+                 }
+             }
+@@ -94,7 +100,9 @@ public static class XrefScannerLowLevel
+             case OpKind.FarBranch32:
+                 return instruction.FarBranch32;
+             default:
+-                throw new ArgumentOutOfRangeException();
++                // Indirect branch (register/memory operand): no static target to extract.
++                // Matches the public XrefScanner.ExtractTargetAddress contract.
++                return 0;
+         }
+     }
+ }

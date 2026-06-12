@@ -65,3 +65,7 @@ MsiInstaller/obj/
 mac-spike/bepinex/
 mac-spike/staging/
 mac-spike/interop/
+# Mac spike: binary DLL backups and build output (keep source, patches, docs)
+mac-spike/interop-test/
+mac-spike/helloworld-plugin/bin/
+mac-spike/helloworld-plugin/obj/
