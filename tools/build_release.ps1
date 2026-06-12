@@ -72,10 +72,10 @@ Write-Host "=== Building MSI installer ==="
 # installed we just skip it (the EXE + PS1 routes still ship).
 try {
     & "$PSScriptRoot\build_msi.ps1" $Version
-    if ($LASTEXITCODE -ne 0) { Write-Host "  MSI build returned $LASTEXITCODE — skipping" -ForegroundColor Yellow }
+    if ($LASTEXITCODE -ne 0) { Write-Host "  MSI build returned $LASTEXITCODE - skipping" -ForegroundColor Yellow }
 } catch {
     Write-Host "  MSI build skipped: $($_.Exception.Message)" -ForegroundColor Yellow
-    Write-Host "  (Install WiX v5: dotnet tool install --global wix --version 5.0.2; wix extension add -g WixToolset.UI.wixext/5.0.2)" -ForegroundColor Yellow
+    Write-Host '  Install WiX v5: dotnet tool install --global wix --version 5.0.2 ; wix extension add -g WixToolset.UI.wixext/5.0.2' -ForegroundColor Yellow
 }
 Write-Host ""
 

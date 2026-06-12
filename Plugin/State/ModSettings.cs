@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using Newtonsoft.Json;
@@ -20,13 +21,27 @@ namespace MTGAEnhancementSuite.State
         public bool DisableCardVFX { get; set; } = false;
 
         /// <summary>
-        /// User-defined deck folders + root-level ordering. Stored on-disk
-        /// in this settings file only — never in deck names, never in
-        /// MTGA's deck state, never on the wire. A user running MTGA on a
-        /// different machine without the mod sees the normal deck list.
+        /// LEGACY: pre-v0.19 user-defined deck folders + root-order, stored as
+        /// a single shared blob. Kept for backwards compat — on first access
+        /// for an account, <see cref="Features.DeckOrganizationManager"/>
+        /// migrates whatever's in here into that account's slot in
+        /// <see cref="DeckOrganizationByAccount"/>, then clears it. Folder data
+        /// is account-specific because folder DeckIds reference cloud decks,
+        /// which differ per MTGA account.
         /// </summary>
         [JsonProperty("deckOrganization")]
         public DeckOrganization DeckOrganization { get; set; } = new DeckOrganization();
+
+        /// <summary>
+        /// User-defined deck folders + root-level ordering, keyed by MTGA
+        /// PersonaID. A user with multiple accounts gets independent folder
+        /// structures per account — switching accounts doesn't disturb the
+        /// other's setup. Stored on-disk in this settings file only — never in
+        /// deck names, never in MTGA's deck state, never on the wire.
+        /// </summary>
+        [JsonProperty("deckOrganizationByAccount")]
+        public Dictionary<string, DeckOrganization> DeckOrganizationByAccount { get; set; }
+            = new Dictionary<string, DeckOrganization>();
 
         public static ModSettings Instance
         {
@@ -64,6 +79,11 @@ namespace MTGAEnhancementSuite.State
                     if (settings.DeckOrganization == null)
                     {
                         settings.DeckOrganization = new DeckOrganization();
+                        needsRewrite = true;
+                    }
+                    if (settings.DeckOrganizationByAccount == null)
+                    {
+                        settings.DeckOrganizationByAccount = new Dictionary<string, DeckOrganization>();
                         needsRewrite = true;
                     }
                     // If the on-disk JSON doesn't already include the

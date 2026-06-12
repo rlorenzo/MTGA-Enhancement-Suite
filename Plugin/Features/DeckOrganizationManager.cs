@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
+using HarmonyLib;
 using MTGAEnhancementSuite.State;
 
 namespace MTGAEnhancementSuite.Features
@@ -21,7 +23,108 @@ namespace MTGAEnhancementSuite.Features
     /// </summary>
     internal static class DeckOrganizationManager
     {
-        private static DeckOrganization Org => ModSettings.Instance.DeckOrganization;
+        // -----------------------------------------------------------------
+        // Per-account resolution
+        //
+        // Folders+assignments are account-specific (the DeckIds inside a
+        // folder reference cloud decks, which differ per MTGA account). We
+        // key everything by the current account's PersonaID — a user with
+        // multiple accounts gets independent folder structures, and
+        // switching accounts doesn't disturb the other's setup.
+        // -----------------------------------------------------------------
+
+        // Cached reflection chain for Pantry.Get<IAccountClient>().AccountInformation.PersonaID.
+        // The IAccountClient interface lives in an assembly we can't reference
+        // by type, so we resolve it by name once and cache the members.
+        private static MethodInfo _pantryGetAccountClient;
+        private static PropertyInfo _accountInfoProp;
+        private static FieldInfo _personaIdField;
+
+        // (personaId, org) snapshot so the hot read accessors (Folders /
+        // FindFolderById / RootOrder) don't reflect on every call. Refreshed
+        // when the resolved PersonaID changes — covers in-session account
+        // switches once the new login propagates through Pantry.
+        private static string _cachedPersonaId;
+        private static DeckOrganization _cachedOrg;
+
+        // Returned when the resolver can't yet find a logged-in PersonaID
+        // (Pantry not initialised, account info not loaded). Read-only in
+        // practice: the deck manager screen isn't reachable pre-login, so the
+        // mutation methods shouldn't ever land here. We never persist this
+        // stub, so anything that did land would just be discarded.
+        private static readonly DeckOrganization _preLoginStub = new DeckOrganization();
+
+        private static DeckOrganization Org => ResolveOrg();
+
+        private static DeckOrganization ResolveOrg()
+        {
+            var id = ResolveCurrentPersonaId();
+            if (id == _cachedPersonaId && _cachedOrg != null) return _cachedOrg;
+
+            var settings = ModSettings.Instance;
+            if (string.IsNullOrEmpty(id))
+            {
+                _cachedPersonaId = null;
+                _cachedOrg = null;
+                return _preLoginStub;
+            }
+
+            if (!settings.DeckOrganizationByAccount.TryGetValue(id, out var org) || org == null)
+            {
+                // First time this account has touched its folder slot on this
+                // install. If the legacy pre-v0.19 global blob still has data
+                // and no per-account bucket has been minted yet, hand it to
+                // this account (one-time migration) so existing users don't
+                // come back to an empty deck manager. Otherwise start fresh.
+                var legacy = settings.DeckOrganization;
+                bool legacyHasData = legacy != null &&
+                    ((legacy.Folders?.Count ?? 0) > 0 || (legacy.RootOrder?.Count ?? 0) > 0);
+                if (legacyHasData && settings.DeckOrganizationByAccount.Count == 0)
+                {
+                    org = legacy;
+                    settings.DeckOrganization = new DeckOrganization();
+                    Plugin.Log.LogInfo(
+                        $"DeckOrganization: migrated legacy global folders " +
+                        $"({org.Folders.Count} folder(s), {org.RootOrder.Count} root entries) " +
+                        $"to account {id}");
+                }
+                else
+                {
+                    org = new DeckOrganization();
+                    Plugin.Log.LogInfo($"DeckOrganization: created fresh slot for account {id}");
+                }
+                settings.DeckOrganizationByAccount[id] = org;
+                settings.Save();
+            }
+
+            _cachedPersonaId = id;
+            _cachedOrg = org;
+            return org;
+        }
+
+        private static string ResolveCurrentPersonaId()
+        {
+            try
+            {
+                if (_pantryGetAccountClient == null)
+                {
+                    var pantryType = AccessTools.TypeByName("Pantry");
+                    var accountClientType = AccessTools.TypeByName("IAccountClient");
+                    if (pantryType == null || accountClientType == null) return null;
+                    _pantryGetAccountClient = pantryType.GetMethod("Get")
+                        ?.MakeGenericMethod(accountClientType);
+                    _accountInfoProp = AccessTools.Property(accountClientType, "AccountInformation");
+                }
+                var accountClient = _pantryGetAccountClient?.Invoke(null, null);
+                if (accountClient == null) return null;
+                var info = _accountInfoProp?.GetValue(accountClient);
+                if (info == null) return null;
+                if (_personaIdField == null)
+                    _personaIdField = AccessTools.Field(info.GetType(), "PersonaID");
+                return _personaIdField?.GetValue(info) as string;
+            }
+            catch { return null; }
+        }
 
         // ---- Read accessors ----
 
